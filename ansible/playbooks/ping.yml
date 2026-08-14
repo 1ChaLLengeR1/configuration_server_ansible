@@ -1,0 +1,12 @@
+---
+- name: Test połączenia z serwerem
+  hosts: all
+  gather_facts: true
+
+  tasks:
+    - name: Ping serwera
+      ansible.builtin.ping:
+
+    - name: Pokaż podstawowe informacje o serwerze
+      ansible.builtin.debug:
+        msg: "Połączono z {{ inventory_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_version }})"
