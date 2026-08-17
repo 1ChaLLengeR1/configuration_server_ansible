@@ -1,0 +1,35 @@
+---
+# UWAGA: uruchamiaj TYLKO po potwierdzeniu, że logowanie jako artur kluczem SSH
+# działa (np. `make verify-artur`). Ten playbook wyłącza logowanie hasłem
+# i logowanie roota — błędna konfiguracja klucza wcześniej = brak dostępu do serwera.
+- name: Wyłącz logowanie root i hasłem przez SSH
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Wyłącz logowanie root przez SSH
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?\s*PermitRootLogin'
+        line: 'PermitRootLogin no'
+      notify: Restart sshd
+
+    - name: Wyłącz logowanie hasłem przez SSH
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?\s*PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+      notify: Restart sshd
+
+    - name: Upewnij się, że logowanie kluczem jest włączone
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?\s*PubkeyAuthentication'
+        line: 'PubkeyAuthentication yes'
+      notify: Restart sshd
+
+  handlers:
+    - name: Restart sshd
+      ansible.builtin.service:
+        name: ssh
+        state: restarted

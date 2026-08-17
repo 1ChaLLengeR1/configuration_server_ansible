@@ -1,0 +1,51 @@
+---
+# Klucz SSH dla artura jest generowany ręcznie poza Ansible (patrz README/instrukcja)
+# i montowany do kontenera pod stałą ścieżką /keys/artur (patrz dockerfiles/docker-compose.yml,
+# zmienna ARTUR_SSH_KEY_PATH w .env).
+- name: Utwórz użytkownika artur na serwerze
+  hosts: all
+  become: true
+  vars:
+    artur_key_path: /keys/artur/id_ed25519
+    artur_password: "{{ lookup('env', 'ARTUR_PASSWORD') }}"
+
+  tasks:
+    - name: Sprawdź, czy klucz publiczny artura jest dostępny w kontenerze
+      ansible.builtin.stat:
+        path: "{{ artur_key_path }}.pub"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: artur_pub_key_stat
+
+    - name: Przerwij, jeśli brakuje klucza publicznego
+      ansible.builtin.fail:
+        msg: >
+          Brak {{ artur_key_path }}.pub w kontenerze — wygeneruj klucz na hoście
+          (ścieżka z ARTUR_SSH_KEY_PATH w .env) i uruchom `make up` ponownie, żeby zamontować katalog.
+      when: not artur_pub_key_stat.stat.exists
+
+    - name: Utwórz użytkownika artur z prawami sudo
+      ansible.builtin.user:
+        name: artur
+        password: "{{ artur_password | password_hash('sha512') }}"
+        groups: sudo
+        append: true
+        shell: /bin/bash
+        create_home: true
+
+    - name: Utwórz katalog .ssh dla artura
+      ansible.builtin.file:
+        path: /home/artur/.ssh
+        state: directory
+        owner: artur
+        group: artur
+        mode: "0700"
+
+    - name: Wgraj klucz publiczny artura jako authorized_keys
+      ansible.builtin.copy:
+        content: "{{ lookup('file', artur_key_path + '.pub') }}"
+        dest: /home/artur/.ssh/authorized_keys
+        owner: artur
+        group: artur
+        mode: "0600"

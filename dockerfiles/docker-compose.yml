@@ -1,0 +1,15 @@
+services:
+  ansible:
+    build:
+      context: .
+      dockerfile: ansible.dockerfile
+    image: ansible-control
+    container_name: ansible-control
+    env_file:
+      - ../.env
+    volumes:
+      - ../ansible:/ansible
+      - ${ARTUR_SSH_KEY_PATH:-../ansible/files/artur}:/keys/artur:ro
+    working_dir: /ansible
+    command: sleep infinity
+    tty: true
