@@ -1,0 +1,60 @@
+---
+# Uruchamiaj PRZED playbooks/postgresql.yml — dopiero `docker swarm init` w tym
+# playbooku tworzy sieć docker_gwbridge, przez którą usługi Swarm (overlay)
+# łączą się z hostem, a której gateway/podsieć wykrywa potem postgresql.yml.
+- name: Zainstaluj Docker CE i zainicjuj Docker Swarm
+  hosts: all
+  become: true
+  vars:
+    swarm_advertise_addr: "{{ lookup('env', 'SERVER_HOST_1') }}"
+
+  tasks:
+    - name: Odczytaj architekturę pakietów (dpkg)
+      ansible.builtin.command: dpkg --print-architecture
+      register: dpkg_arch
+      changed_when: false
+
+    - name: Dodaj repozytorium apt Docker CE (klucz GPG pobierany i zaufany automatycznie)
+      ansible.builtin.deb822_repository:
+        name: docker
+        types: deb
+        uris: https://download.docker.com/linux/debian
+        suites: "{{ ansible_facts['distribution_release'] }}"
+        components: stable
+        architectures: "{{ [dpkg_arch.stdout] }}"
+        signed_by: https://download.docker.com/linux/debian/gpg
+        install_python_debian: true
+        state: present
+
+    - name: Zainstaluj Docker Engine + pluginy (buildx, compose)
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Upewnij się, że Docker działa i jest włączony na starcie
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Sprawdź aktualny stan Docker Swarm na węźle
+      ansible.builtin.command:
+        cmd: >-
+          docker info --format '{% raw %}{{.Swarm.LocalNodeState}}{% endraw %}'
+      register: swarm_state
+      changed_when: false
+
+    - name: Przerwij, jeśli brakuje SERVER_HOST_1 w .env
+      ansible.builtin.fail:
+        msg: "SERVER_HOST_1 nie jest ustawiony w .env — potrzebny jako --advertise-addr dla swarm init."
+      when: swarm_state.stdout != 'active' and not swarm_advertise_addr
+
+    - name: Zainicjuj Docker Swarm (jeśli węzeł nie jest jeszcze w swarmie)
+      ansible.builtin.command: "docker swarm init --advertise-addr {{ swarm_advertise_addr }}"
+      when: swarm_state.stdout != 'active'

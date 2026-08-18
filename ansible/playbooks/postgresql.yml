@@ -1,0 +1,114 @@
+---
+# WYMAGA wcześniej zainicjowanego Docker Swarm (patrz playbooks/docker_swarm.yml) —
+# ten playbook celuje w sieć docker_gwbridge, którą Docker tworzy automatycznie
+# przy `docker swarm init` (to NIE jest zwykły mostek docker0/172.17.x — usługi
+# wdrożone przez `docker service`/`docker stack deploy` na sieciach overlay łączą
+# się z hostem właśnie przez docker_gwbridge, zwykle 172.18.0.0/16, ale gateway/
+# podsieć są wykrywane dynamicznie, bo mogą się różnić między środowiskami).
+# Uruchamiaj w kolejności: docker_swarm.yml, potem ten playbook.
+- name: Zainstaluj PostgreSQL natywnie i skonfiguruj dostęp dla Swarm (docker_gwbridge)
+  hosts: all
+  become: true
+  vars:
+    deploy_db_user: deploy
+    deploy_db_password: "{{ lookup('env', 'PG_DEPLOY_PASSWORD_1') }}"
+
+  tasks:
+    - name: Przerwij, jeśli brakuje PG_DEPLOY_PASSWORD_1 w .env
+      ansible.builtin.fail:
+        msg: >
+          Ustaw PG_DEPLOY_PASSWORD_1 w .env (hasło CI dla użytkownika
+          '{{ deploy_db_user }}' w PostgreSQL) i uruchom `make up` ponownie.
+      when: not deploy_db_password
+      run_once: true
+
+    - name: Sprawdź sieć docker_gwbridge i odczytaj jej gateway/podsieć
+      ansible.builtin.command:
+        cmd: >-
+          docker network inspect docker_gwbridge
+          --format '{% raw %}{{range .IPAM.Config}}{{.Gateway}} {{.Subnet}}{{end}}{% endraw %}'
+      register: gwbridge_inspect
+      changed_when: false
+      failed_when: false
+
+    - name: Przerwij, jeśli docker_gwbridge nie istnieje (Swarm jeszcze nie zainicjowany)
+      ansible.builtin.fail:
+        msg: >
+          Sieć docker_gwbridge nie istnieje na tym hoście — tworzy ją
+          `docker swarm init`. Uruchom najpierw `make install-docker-swarm`,
+          dopiero potem ten playbook.
+      when: gwbridge_inspect.rc != 0 or gwbridge_inspect.stdout | trim == ''
+
+    - name: Ustal gateway i podsieć docker_gwbridge
+      ansible.builtin.set_fact:
+        gwbridge_gateway: "{{ gwbridge_inspect.stdout.split(' ')[0] }}"
+        gwbridge_subnet: "{{ gwbridge_inspect.stdout.split(' ')[1] }}"
+
+    - name: Zainstaluj PostgreSQL, psycopg2 i acl (wymagane przez moduły Ansible)
+      ansible.builtin.apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+          - python3-psycopg2
+          - acl
+        state: present
+        update_cache: true
+
+    - name: Upewnij się, że PostgreSQL działa i jest włączony na starcie
+      ansible.builtin.service:
+        name: postgresql
+        state: started
+        enabled: true
+
+    - name: Znajdź postgresql.conf aktywnego klastra
+      ansible.builtin.find:
+        paths: /etc/postgresql
+        patterns: "postgresql.conf"
+        recurse: true
+      register: pg_conf_find
+
+    - name: Przerwij, jeśli nie znaleziono postgresql.conf
+      ansible.builtin.fail:
+        msg: "Nie znaleziono postgresql.conf pod /etc/postgresql — sprawdź instalację PostgreSQL."
+      when: pg_conf_find.matched == 0
+
+    - name: Ustal katalog konfiguracyjny klastra
+      ansible.builtin.set_fact:
+        pg_conf_dir: "{{ pg_conf_find.files[0].path | dirname }}"
+
+    - name: Ustaw listen_addresses (localhost + gateway docker_gwbridge, dla Swarm)
+      ansible.builtin.lineinfile:
+        path: "{{ pg_conf_dir }}/postgresql.conf"
+        regexp: '^#?\s*listen_addresses\s*='
+        line: "listen_addresses = 'localhost,{{ gwbridge_gateway }}'"
+      notify: Zrestartuj PostgreSQL
+
+    - name: Dodaj wpisy pg_hba.conf dla użytkownika deploy (localhost + podsieć docker_gwbridge/Swarm)
+      ansible.builtin.blockinfile:
+        path: "{{ pg_conf_dir }}/pg_hba.conf"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - deploy user"
+        block: |
+          host    all             {{ deploy_db_user }}          127.0.0.1/32            scram-sha-256
+          host    all             {{ deploy_db_user }}          {{ gwbridge_subnet }}           scram-sha-256
+      notify: Zrestartuj PostgreSQL
+
+    - name: Wymuś natychmiastowy restart przed utworzeniem użytkownika (jeśli config się zmienił)
+      ansible.builtin.meta: flush_handlers
+
+    # become_user: postgres z połączeniem jako user bez uprawnień (SERVER_USER_1)
+    # wymaga pakietu acl (setfacl) na hoście, inaczej Ansible nie potrafi
+    # ustawić uprawnień na pliku tymczasowym modułu dla "postgres".
+    - name: Utwórz/zaktualizuj użytkownika deploy w PostgreSQL
+      become_user: postgres
+      community.postgresql.postgresql_user:
+        name: "{{ deploy_db_user }}"
+        password: "{{ deploy_db_password }}"
+        role_attr_flags: LOGIN
+        encrypted: true
+        state: present
+
+  handlers:
+    - name: Zrestartuj PostgreSQL
+      ansible.builtin.service:
+        name: postgresql
+        state: restarted

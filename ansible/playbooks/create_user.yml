@@ -1,51 +1,53 @@
 ---
-# Klucz SSH dla artura jest generowany ręcznie poza Ansible (patrz README/instrukcja)
-# i montowany do kontenera pod stałą ścieżką /keys/artur (patrz dockerfiles/docker-compose.yml,
-# zmienna ARTUR_SSH_KEY_PATH w .env).
-- name: Utwórz użytkownika artur na serwerze
+# Klucz SSH dla docelowego użytkownika jest generowany ręcznie poza Ansible (patrz
+# README/instrukcja) i montowany do kontenera pod ścieżką /keys/<SERVER_USER_1>
+# (patrz dockerfiles/docker-compose.yml, zmienne SERVER_USER_1 / SERVER_SSH_KEY_PATH_1 w .env).
+- name: Utwórz docelowego użytkownika na serwerze
   hosts: all
   become: true
   vars:
-    artur_key_path: /keys/artur/id_ed25519
-    artur_password: "{{ lookup('env', 'ARTUR_PASSWORD') }}"
+    target_user: "{{ lookup('env', 'SERVER_USER_1') }}"
+    target_key_path: "/keys/{{ target_user }}/id_ed25519"
+    target_password: "{{ lookup('env', 'SERVER_PASSWORD_1') }}"
 
   tasks:
-    - name: Sprawdź, czy klucz publiczny artura jest dostępny w kontenerze
+    - name: Sprawdź, czy klucz publiczny użytkownika jest dostępny w kontenerze
       ansible.builtin.stat:
-        path: "{{ artur_key_path }}.pub"
+        path: "{{ target_key_path }}.pub"
       delegate_to: localhost
       become: false
       run_once: true
-      register: artur_pub_key_stat
+      register: target_pub_key_stat
 
     - name: Przerwij, jeśli brakuje klucza publicznego
       ansible.builtin.fail:
         msg: >
-          Brak {{ artur_key_path }}.pub w kontenerze — wygeneruj klucz na hoście
-          (ścieżka z ARTUR_SSH_KEY_PATH w .env) i uruchom `make up` ponownie, żeby zamontować katalog.
-      when: not artur_pub_key_stat.stat.exists
+          Brak {{ target_key_path }}.pub w kontenerze — wygeneruj klucz na hoście
+          (ścieżka z SERVER_SSH_KEY_PATH_1 w .env, nazwa katalogu = SERVER_USER_1)
+          i uruchom `make up` ponownie, żeby zamontować katalog.
+      when: not target_pub_key_stat.stat.exists
 
-    - name: Utwórz użytkownika artur z prawami sudo
+    - name: Utwórz użytkownika z prawami sudo
       ansible.builtin.user:
-        name: artur
-        password: "{{ artur_password | password_hash('sha512') }}"
+        name: "{{ target_user }}"
+        password: "{{ target_password | password_hash('sha512') }}"
         groups: sudo
         append: true
         shell: /bin/bash
         create_home: true
 
-    - name: Utwórz katalog .ssh dla artura
+    - name: Utwórz katalog .ssh dla użytkownika
       ansible.builtin.file:
-        path: /home/artur/.ssh
+        path: "/home/{{ target_user }}/.ssh"
         state: directory
-        owner: artur
-        group: artur
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
         mode: "0700"
 
-    - name: Wgraj klucz publiczny artura jako authorized_keys
+    - name: Wgraj klucz publiczny jako authorized_keys
       ansible.builtin.copy:
-        content: "{{ lookup('file', artur_key_path + '.pub') }}"
-        dest: /home/artur/.ssh/authorized_keys
-        owner: artur
-        group: artur
+        content: "{{ lookup('file', target_key_path + '.pub') }}"
+        dest: "/home/{{ target_user }}/.ssh/authorized_keys"
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
         mode: "0600"

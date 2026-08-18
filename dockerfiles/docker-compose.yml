@@ -9,7 +9,7 @@ services:
       - ../.env
     volumes:
       - ../ansible:/ansible
-      - ${ARTUR_SSH_KEY_PATH:-../ansible/files/artur}:/keys/artur:ro
+      - ${SERVER_SSH_KEY_PATH_1:-../ansible/files/artur}:/keys/${SERVER_USER_1:-artur}:ro
     working_dir: /ansible
     command: sleep infinity
     tty: true
