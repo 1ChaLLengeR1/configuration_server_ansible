@@ -103,7 +103,11 @@
       community.postgresql.postgresql_user:
         name: "{{ deploy_db_user }}"
         password: "{{ deploy_db_password }}"
-        role_attr_flags: LOGIN
+        # CREATEDB pozwala userowi deploy samodzielnie tworzyć bazy danych
+        # (np. z poziomu pgAdmin4). Jako właściciel utworzonej bazy deploy
+        # automatycznie ma pełne prawa (CREATE/SELECT/UPDATE/DELETE) do
+        # wszystkich tabel, które w niej stworzy — nie trzeba dodatkowych GRANT-ów.
+        role_attr_flags: LOGIN,CREATEDB
         encrypted: true
         state: present
 
