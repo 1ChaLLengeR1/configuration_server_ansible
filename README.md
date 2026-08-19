@@ -23,10 +23,11 @@ tworzenie użytkowników, hardening SSH.
     ├── inventory/hosts.yml         # lista serwerów
     └── playbooks/
         ├── ping.yml                # test połączenia
-        ├── create_user.yml         # tworzy usera + wgrywa klucz SSH + sudo
+        ├── create_user.yml         # tworzy usera (SERVER_USER_1) + wgrywa klucz SSH + sudo
         ├── harden_ssh.yml          # wyłącza root/hasła w SSH
         ├── docker_swarm.yml        # instaluje Docker CE + docker swarm init
-        └── postgresql.yml          # instaluje PostgreSQL + user deploy dla Swarm
+        ├── postgresql.yml          # instaluje PostgreSQL + rolę deploy (CREATEDB) dla Swarm
+        └── add_user.yml            # dodaje kolejnego usera (NEW_USER_*) + weryfikuje logowanie SSH
 ```
 
 ## Krok 1 — `.env` w katalogu głównym
@@ -192,8 +193,11 @@ po prostu jeszcze nie będzie istnieć).
    make install-postgresql
    ```
 
-   Playbook **nie tworzy bazy danych** — tylko rolę `deploy` (`LOGIN`, bez
-   `SUPERUSER`). Bazę i uprawnienia do niej twórz osobno.
+   Playbook tworzy tylko rolę `deploy` (`LOGIN`, `CREATEDB`, bez `SUPERUSER`) —
+   sam nie zakłada żadnej bazy. Dzięki `CREATEDB` rola `deploy` może sama
+   tworzyć bazy (np. z poziomu pgAdmin4 po tunelu SSH) i jako właściciel
+   utworzonej bazy ma automatycznie pełne prawa (CREATE/SELECT/UPDATE/DELETE)
+   do wszystkich tabel, które w niej stworzy — bez dodatkowych `GRANT`-ów.
 
 **Uwaga bezpieczeństwa:** `listen_addresses` celowo nie zawiera `*`/`0.0.0.0`
 — PostgreSQL nie nasłuchuje na publicznym interfejsie serwera, tylko na
@@ -208,6 +212,49 @@ w obrębie tej samej bazy. Rola `deploy` jest też tworzona z `encrypted: true`
 w module `community.postgresql.postgresql_user`, więc jej hasło w bazie jest
 przechowywane jako hash `scram-sha-256`, nie w postaci jawnej ani jako `md5`.
 
+## Krok 8 — kolejny użytkownik (np. `deploy`) przez `add_user.yml`
+
+Playbook `create_user.yml` (Krok 4) jest przywiązany na sztywno do `SERVER_USER_1`.
+Do dodawania **kolejnych** userów (np. systemowego `deploy` do logowania z
+GitHub Actions) służy generyczny `add_user.yml` — łączy się jako już istniejący
+sudo-user (`SERVER_USER_1`), tworzy nowego usera, wgrywa jego klucz publiczny
+i na końcu **sam** otwiera nowe, niezależne połączenie SSH kluczem prywatnym
+nowego usera, żeby sprawdzić, że logowanie faktycznie działa (playbook faili
+się, jeśli nie).
+
+1. Wygeneruj klucz **lokalnie**, tak jak w Kroku 4 (bez `-N`/z pustym hasłem,
+   jeśli klucz ma trafić np. do sekretu w GitHub Actions):
+
+   ```
+   ssh-keygen -t ed25519 -f ~/.ssh/<jakas-sciezka>/deploy/id_ed25519 -N "" -C "deploy"
+   ```
+
+2. Uzupełnij w `.env`:
+
+   ```env
+   NEW_USER_NAME=deploy
+   NEW_USER_SSH_KEY_PATH=/home/<user>/.ssh/<jakas-sciezka>/deploy/
+   NEW_USER_PASSWORD=silne-haslo-dla-uzytkownika
+   NEW_USER_SUDO=true
+   ```
+
+   `NEW_USER_SSH_KEY_PATH` montuje się do kontenera pod `/keys/${NEW_USER_NAME}`
+   (patrz drugi wpis `volumes` w `dockerfiles/docker-compose.yml`).
+
+3. `make up` (złapać nowy mount), potem:
+
+   ```
+   make add-user
+   ```
+
+   Playbook tworzy usera, wgrywa klucz i od razu weryfikuje logowanie —
+   wynik widać w outpucie (`whoami` + status `sudo`), bez osobnego kroku
+   w stylu `verify-user`.
+
+Uwaga: `deploy` z tego kroku to **osobny byt** od roli `deploy` w PostgreSQL
+z Kroku 7 — jeden to user systemowy (SSH na serwer), drugi to rola w bazie
+danych. Mogą mieć tę samą nazwę i różne hasła, nie mają ze sobą nic wspólnego.
+
 ## Zmienne `.env` — podsumowanie
 
 | Zmienna | Do czego służy |
@@ -219,6 +266,10 @@ przechowywane jako hash `scram-sha-256`, nie w postaci jawnej ani jako `md5`.
 | `SERVER_SSH_KEY_PATH_1` | katalog z kluczem SSH docelowego użytkownika (host, montowany do kontenera) |
 | `SERVER_PASSWORD_1` | hasło systemowe docelowego użytkownika (do logowania lokalnego / `sudo`) |
 | `PG_DEPLOY_PASSWORD_1` | hasło CI dla roli `deploy` w PostgreSQL (`playbooks/postgresql.yml`) |
+| `NEW_USER_NAME` | nazwa kolejnego usera do dodania (`playbooks/add_user.yml`) |
+| `NEW_USER_SSH_KEY_PATH` | katalog z kluczem SSH tego usera (host, montowany do kontenera) |
+| `NEW_USER_PASSWORD` | hasło systemowe tego usera (do `sudo`, nie do logowania SSH) |
+| `NEW_USER_SUDO` | `true`/`false` — czy dodać usera do grupy `sudo` (domyślnie `true`) |
 
 ## Wszystkie komendy `make`
 
@@ -233,4 +284,5 @@ przechowywane jako hash `scram-sha-256`, nie w postaci jawnej ani jako `md5`.
 | `make verify-user` | sprawdź logowanie kluczem jako `SERVER_USER_1` |
 | `make harden-ssh` | wyłącz root/hasła w SSH (`playbooks/harden_ssh.yml`) |
 | `make install-docker-swarm` | zainstaluj Docker CE + `docker swarm init` (`playbooks/docker_swarm.yml`) |
-| `make install-postgresql` | zainstaluj PostgreSQL + skonfiguruj dostęp dla Swarm + user `deploy` (`playbooks/postgresql.yml`) |
+| `make install-postgresql` | zainstaluj PostgreSQL + skonfiguruj dostęp dla Swarm + rolę `deploy` z `CREATEDB` (`playbooks/postgresql.yml`) |
+| `make add-user` | dodaj kolejnego usera z `NEW_USER_*` + klucz + weryfikacja logowania SSH (`playbooks/add_user.yml`) |

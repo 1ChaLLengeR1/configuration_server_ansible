@@ -1,0 +1,115 @@
+---
+# Generyczny playbook do dodawania KOLEJNYCH userów na serwerze (nie tylko artur/deploy).
+# Łączy się jako istniejący sudo-user (SERVER_USER_1 z ansible/inventory/hosts.yml — roota
+# nie ma, logowanie tylko kluczem, patrz harden_ssh.yml), tworzy nowego użytkownika, nadaje
+# mu hasło (służy tylko do sudo — logowanie hasłem po SSH jest wyłączone), importuje klucz
+# publiczny zamontowany z komputera lokalnego, a na końcu SAM weryfikuje nowym, niezależnym
+# połączeniem SSH (czyli już bez sesji become/sudo z powyższych kroków), że nowy user
+# faktycznie loguje się swoim kluczem prywatnym.
+#
+# Zmienne czytane z .env (sekcja "Nowy user"): NEW_USER_NAME, NEW_USER_SSH_KEY_PATH,
+# NEW_USER_PASSWORD, NEW_USER_SUDO.
+#
+# Przed uruchomieniem:
+#   1. Wygeneruj klucz na hoście (katalog = NEW_USER_SSH_KEY_PATH, nazwa = NEW_USER_NAME):
+#        ssh-keygen -t ed25519 -f <NEW_USER_SSH_KEY_PATH>/id_ed25519 -C "<twój e-mail>" -N ""
+#   2. Uzupełnij NEW_USER_* w .env.
+#   3. `make up` (żeby domontować katalog z kluczem do kontenera — patrz docker-compose.yml).
+#   4. `make add-user`.
+- name: Dodaj nowego użytkownika na serwerze i zweryfikuj logowanie kluczem SSH
+  hosts: all
+  become: true
+  vars:
+    new_user_name: "{{ lookup('env', 'NEW_USER_NAME') }}"
+    new_user_key_path: "/keys/{{ new_user_name }}/id_ed25519"
+    new_user_password: "{{ lookup('env', 'NEW_USER_PASSWORD') }}"
+    new_user_sudo: "{{ lookup('env', 'NEW_USER_SUDO') | default('true', true) | bool }}"
+
+  tasks:
+    - name: Przerwij, jeśli brakuje NEW_USER_NAME / NEW_USER_PASSWORD w .env
+      ansible.builtin.fail:
+        msg: >
+          Ustaw NEW_USER_NAME i NEW_USER_PASSWORD w .env i uruchom `make add-user` ponownie.
+      when: not new_user_name or not new_user_password
+      run_once: true
+
+    - name: Sprawdź, czy klucz publiczny nowego użytkownika jest dostępny w kontenerze
+      ansible.builtin.stat:
+        path: "{{ new_user_key_path }}.pub"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: new_user_pub_key_stat
+
+    - name: Przerwij, jeśli brakuje klucza publicznego
+      ansible.builtin.fail:
+        msg: >
+          Brak {{ new_user_key_path }}.pub w kontenerze — wygeneruj klucz na hoście
+          (ścieżka z NEW_USER_SSH_KEY_PATH w .env, nazwa katalogu = NEW_USER_NAME),
+          upewnij się, że jest zamontowany w dockerfiles/docker-compose.yml
+          (wolumen NEW_USER_SSH_KEY_PATH/NEW_USER_NAME) i uruchom `make up` ponownie.
+      when: not new_user_pub_key_stat.stat.exists
+
+    - name: Utwórz nowego użytkownika (opcjonalnie z prawami sudo — NEW_USER_SUDO)
+      ansible.builtin.user:
+        name: "{{ new_user_name }}"
+        password: "{{ new_user_password | password_hash('sha512') }}"
+        groups: "{{ 'sudo' if new_user_sudo else omit }}"
+        append: true
+        shell: /bin/bash
+        create_home: true
+
+    - name: Utwórz katalog .ssh dla nowego użytkownika
+      ansible.builtin.file:
+        path: "/home/{{ new_user_name }}/.ssh"
+        state: directory
+        owner: "{{ new_user_name }}"
+        group: "{{ new_user_name }}"
+        mode: "0700"
+
+    - name: Zaimportuj klucz publiczny jako authorized_keys
+      ansible.builtin.copy:
+        content: "{{ lookup('file', new_user_key_path + '.pub') }}"
+        dest: "/home/{{ new_user_name }}/.ssh/authorized_keys"
+        owner: "{{ new_user_name }}"
+        group: "{{ new_user_name }}"
+        mode: "0600"
+
+    - name: Weryfikacja — nowe, niezależne połączenie SSH kluczem prywatnym nowego użytkownika
+      ansible.builtin.command:
+        cmd: >-
+          ssh -i {{ new_user_key_path }}
+          -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10
+          {{ new_user_name }}@{{ ansible_host }}
+          whoami
+      delegate_to: localhost
+      become: false
+      register: verify_login
+      changed_when: false
+
+    - name: Sprawdź, czy weryfikacja logowania się powiodła
+      ansible.builtin.assert:
+        that:
+          - verify_login.stdout | trim == new_user_name
+        fail_msg: >
+          Logowanie kluczem SSH dla {{ new_user_name }} nie powiodło się
+          (oczekiwano whoami={{ new_user_name }}, otrzymano: '{{ verify_login.stdout }}').
+        success_msg: "OK — {{ new_user_name }} loguje się kluczem SSH bez hasła."
+
+    - name: Weryfikacja sudo nowym połączeniem (informacyjnie)
+      ansible.builtin.command:
+        cmd: >-
+          ssh -i {{ new_user_key_path }}
+          -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10
+          {{ new_user_name }}@{{ ansible_host }}
+          "sudo -n true 2>/dev/null && echo sudo:NOPASSWD || echo sudo:wymaga_hasla"
+      delegate_to: localhost
+      become: false
+      register: verify_sudo
+      changed_when: false
+      when: new_user_sudo
+
+    - name: Pokaż wynik weryfikacji sudo
+      ansible.builtin.debug:
+        msg: "{{ verify_sudo.stdout }}"
+      when: new_user_sudo

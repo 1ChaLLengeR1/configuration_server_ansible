@@ -46,3 +46,8 @@ install-docker-swarm:
 ## WYMAGA wcześniejszego `make install-docker-swarm`.
 install-postgresql:
 	$(COMPOSE) exec ansible ansible-playbook playbooks/postgresql.yml
+
+## Dodaj nowego użytkownika (NEW_USER_* w .env) + zaimportuj klucz + zweryfikuj logowanie SSH (ansible/playbooks/add_user.yml)
+## Przed uruchomieniem uzupełnij NEW_USER_* w .env i zrób `make up`, żeby domontować katalog z kluczem.
+add-user:
+	$(COMPOSE) exec ansible ansible-playbook playbooks/add_user.yml

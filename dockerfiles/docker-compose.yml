@@ -10,6 +10,7 @@ services:
     volumes:
       - ../ansible:/ansible
       - ${SERVER_SSH_KEY_PATH_1:-../ansible/files/artur}:/keys/${SERVER_USER_1:-artur}:ro
+      - ${NEW_USER_SSH_KEY_PATH:-../ansible/files/newuser}:/keys/${NEW_USER_NAME:-newuser}:ro
     working_dir: /ansible
     command: sleep infinity
     tty: true
