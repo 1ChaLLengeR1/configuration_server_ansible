@@ -6,7 +6,10 @@
   hosts: all
   become: true
   vars:
-    swarm_advertise_addr: "{{ lookup('env', 'SERVER_HOST_1') }}"
+    # Serwer, który ma kiedyś dostać drugi węzeł: NIE inicjuj Swarma tutaj na publicznym IP - zrób
+    # `make install-wireguard` i `make swarm-wireguard` (Swarm od razu na adresie WG). Ten playbook
+    # zainicjuje Swarm na SWARM_ADVERTISE_ADDR_1, a bez niego na publicznym SERVER_HOST_1.
+    swarm_advertise_addr: "{{ lookup('env', 'SWARM_ADVERTISE_ADDR_1') | default(lookup('env', 'SERVER_HOST_1'), true) }}"
 
   tasks:
     - name: Odczytaj architekturę pakietów (dpkg)

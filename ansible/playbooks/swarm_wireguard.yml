@@ -1,0 +1,100 @@
+---
+# Przeniesienie Docker Swarm na adres WireGuarda (wymaga wcześniej `make install-wireguard`).
+#
+# Swarm zapamiętuje adres z `swarm init` - jeśli zainicjowano go na publicznym IP, ruch Swarma
+# między węzłami szedłby poza tunelem. Ten playbook:
+#   - nic nie robi, jeśli Swarm już działa na adresie WG,
+#   - inicjuje Swarm na adresie WG, jeśli węzeł nie jest w Swarmie,
+#   - jeśli Swarm działa na innym adresie: robi `swarm leave --force` + `swarm init` na adresie WG,
+#     ALE TYLKO gdy w Swarmie nie ma żadnych serwisów i węzeł jest jedynym węzłem (reset kasuje
+#     sieci overlay, sekrety, configi i etykiety węzłów - na pustym Swarmie nic nie tracimy).
+#
+# Zmienne z .env:
+#   WG_ADDRESS_1         - adres WG węzła (z maską), domyślnie 10.99.0.1/24
+#   SWARM_ADDR_POOL_1    - pula adresów sieci overlay, domyślnie 10.20.0.0/16 (maska /24)
+#   SWARM_NODE_LABELS_1  - etykiety węzła po przecinku, np. treet.stateful=true (opcjonalne)
+- name: Docker Swarm na adresie WireGuarda
+  hosts: all
+  become: true
+  vars:
+    wg_address: "{{ lookup('env', 'WG_ADDRESS_1') | default('10.99.0.1/24', true) }}"
+    wg_ip: "{{ wg_address.split('/')[0] }}"
+    swarm_addr_pool: "{{ lookup('env', 'SWARM_ADDR_POOL_1') | default('10.20.0.0/16', true) }}"
+    swarm_node_labels: "{{ lookup('env', 'SWARM_NODE_LABELS_1') | split(',') | map('trim') | select | list }}"
+
+  tasks:
+    - name: Sprawdź, czy wg0 ma adres {{ wg_ip }}
+      ansible.builtin.command: ip -4 -br addr show wg0
+      register: wg_addr
+      changed_when: false
+      failed_when: wg_ip not in wg_addr.stdout
+
+    - name: Odczytaj stan Swarma (stan, adres, liczba węzłów)
+      ansible.builtin.command:
+        cmd: >-
+          docker info --format '{% raw %}{{.Swarm.LocalNodeState}} {{.Swarm.NodeAddr}} {{.Swarm.Nodes}}{% endraw %}'
+      register: swarm_info
+      changed_when: false
+
+    - name: Rozbij stan Swarma
+      ansible.builtin.set_fact:
+        swarm_state: "{{ swarm_info.stdout.split(' ')[0] }}"
+        swarm_addr: "{{ (swarm_info.stdout.split(' ') + [''])[1] }}"
+        swarm_nodes: "{{ (swarm_info.stdout.split(' ') + ['0', '0'])[2] | int }}"
+
+    - name: Policz serwisy w Swarmie (reset tylko na pustym Swarmie)
+      ansible.builtin.command: docker service ls -q
+      register: swarm_services
+      changed_when: false
+      when: swarm_state == 'active' and swarm_addr != wg_ip
+
+    - name: Przerwij, jeśli Swarm na innym adresie ma serwisy albo inne węzły
+      ansible.builtin.fail:
+        msg: >
+          Swarm działa na {{ swarm_addr }} (nie na {{ wg_ip }}) i ma {{ swarm_services.stdout_lines | length }}
+          serwis(ów) / {{ swarm_nodes }} węzeł(ów). Automatyczny reset skasowałby sieci, sekrety i etykiety —
+          przenieś go ręcznie wg runbooka (docs/runbook_clean_slate_wireguard.md w WIW).
+      when:
+        - swarm_state == 'active' and swarm_addr != wg_ip
+        - swarm_services.stdout_lines | length > 0 or swarm_nodes > 1
+
+    - name: Opuść Swarm na starym adresie ({{ swarm_addr }}) - pusty, jednowęzłowy
+      ansible.builtin.command: docker swarm leave --force
+      when: swarm_state == 'active' and swarm_addr != wg_ip
+
+    - name: Zainicjuj Swarm na adresie WireGuarda
+      ansible.builtin.command: >-
+        docker swarm init
+        --advertise-addr {{ wg_ip }}
+        --data-path-addr {{ wg_ip }}
+        --listen-addr {{ wg_ip }}:2377
+        --default-addr-pool {{ swarm_addr_pool }}
+        --default-addr-pool-mask-length 24
+      when: swarm_state != 'active' or swarm_addr != wg_ip
+
+    - name: Nadaj etykiety węzłowi (SWARM_NODE_LABELS_1)
+      ansible.builtin.shell: >-
+        docker node update --label-add {{ item }}
+        "$(docker info --format '{% raw %}{{.Swarm.NodeID}}{% endraw %}')"
+      loop: "{{ swarm_node_labels }}"
+      changed_when: true
+
+    - name: Odczytaj stan po zmianach
+      ansible.builtin.command:
+        cmd: >-
+          docker info --format '{% raw %}{{.Swarm.LocalNodeState}} {{.Swarm.NodeAddr}}{% endraw %}'
+      register: swarm_after
+      changed_when: false
+
+    - name: Odczytaj etykiety węzła
+      ansible.builtin.command:
+        cmd: >-
+          docker node inspect self --format '{% raw %}{{json .Spec.Labels}}{% endraw %}'
+      register: node_labels
+      changed_when: false
+
+    - name: Podsumowanie
+      ansible.builtin.debug:
+        msg:
+          - "Swarm: {{ swarm_after.stdout }}"
+          - "Etykiety: {{ node_labels.stdout }}"

@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f dockerfiles/docker-compose.yml --env-file .env
 
-.PHONY: build up down shell ping logs
+.PHONY: build up down shell ping logs create-user verify-user harden-ssh install-docker-swarm install-postgresql add-user install-firewall install-wireguard swarm-wireguard
 
 ## Zbuduj obraz Docker z Ansible (dockerfiles/ansible.dockerfile)
 build:
@@ -46,6 +46,22 @@ install-docker-swarm:
 ## WYMAGA wcześniejszego `make install-docker-swarm`.
 install-postgresql:
 	$(COMPOSE) exec ansible ansible-playbook playbooks/postgresql.yml
+
+## Zapora ufw (SSH, 80/443, Swarm tylko z WG, WireGuard tylko od peerów, PostgreSQL z docker_gwbridge)
+## + fail2ban na SSH (ansible/playbooks/firewall.yml). Najpierw reguła SSH, potem włączenie ufw.
+install-firewall:
+	$(COMPOSE) exec ansible ansible-playbook playbooks/firewall.yml
+
+## Zainstaluj i skonfiguruj WireGuard wg0 (WG_ADDRESS_1 w .env), Docker startuje po wg0
+## (ansible/playbooks/wireguard.yml). Wypisuje klucz publiczny węzła - potrzebny drugiej stronie tunelu.
+install-wireguard:
+	$(COMPOSE) exec ansible ansible-playbook playbooks/wireguard.yml
+
+## Przenieś Docker Swarm na adres WireGuarda + etykiety węzła (SWARM_* w .env)
+## (ansible/playbooks/swarm_wireguard.yml). Reset Swarma tylko na pustym, jednowęzłowym Swarmie.
+## WYMAGA wcześniej `make install-wireguard`; po nim odpal ponownie `make install-postgresql`.
+swarm-wireguard:
+	$(COMPOSE) exec ansible ansible-playbook playbooks/swarm_wireguard.yml
 
 ## Dodaj nowego użytkownika (NEW_USER_* w .env) + zaimportuj klucz + zweryfikuj logowanie SSH (ansible/playbooks/add_user.yml)
 ## Przed uruchomieniem uzupełnij NEW_USER_* w .env i zrób `make up`, żeby domontować katalog z kluczem.

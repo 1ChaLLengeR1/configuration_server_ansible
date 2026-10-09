@@ -92,6 +92,31 @@
           host    all             {{ deploy_db_user }}          {{ gwbridge_subnet }}           scram-sha-256
       notify: Zrestartuj PostgreSQL
 
+    # listen_addresses zawiera gateway docker_gwbridge, a ten adres istnieje dopiero, gdy wstanie
+    # Docker. Bez tej kolejności po restarcie serwera PostgreSQL startuje pierwszy, pomija brakujący
+    # adres (słucha tylko na localhost) i kontenery Swarma nie mają dostępu do bazy.
+    - name: Katalog drop-in dla postgresql@.service
+      ansible.builtin.file:
+        path: /etc/systemd/system/postgresql@.service.d
+        state: directory
+        mode: "0755"
+
+    - name: PostgreSQL startuje po Dockerze (adres docker_gwbridge)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/postgresql@.service.d/after-docker.conf
+        mode: "0644"
+        content: |
+          # Zarządzane przez Ansible (configuration_server_ansible, postgresql.yml)
+          [Unit]
+          Wants=docker.service
+          After=docker.service
+      register: pg_after_docker
+
+    - name: Przeładuj systemd po dodaniu drop-in
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when: pg_after_docker.changed
+
     - name: Wymuś natychmiastowy restart przed utworzeniem użytkownika (jeśli config się zmienił)
       ansible.builtin.meta: flush_handlers
 
@@ -110,6 +135,32 @@
         role_attr_flags: LOGIN,CREATEDB
         encrypted: true
         state: present
+
+    - name: Sprawdź, na jakich adresach słucha PostgreSQL
+      ansible.builtin.command: ss -ltnH 'sport = :5432'
+      register: pg_listen
+      changed_when: false
+
+    # Config mógł być poprawny od dawna, a PostgreSQL wystartował przed Dockerem (przed drop-inem
+    # wyżej) i słucha tylko na localhost - wtedy wystarczy restart.
+    - name: Zrestartuj PostgreSQL, jeśli nie słucha na gateway docker_gwbridge
+      ansible.builtin.service:
+        name: postgresql
+        state: restarted
+      when: gwbridge_gateway not in pg_listen.stdout
+
+    - name: Sprawdź ponownie adresy PostgreSQL
+      ansible.builtin.command: ss -ltnH 'sport = :5432'
+      register: pg_listen_after
+      changed_when: false
+
+    - name: Upewnij się, że PostgreSQL słucha na gateway docker_gwbridge
+      ansible.builtin.assert:
+        that: "gwbridge_gateway in pg_listen_after.stdout"
+        fail_msg: >
+          PostgreSQL nie słucha na {{ gwbridge_gateway }} (kontenery Swarma nie połączą się z bazą):
+          {{ pg_listen_after.stdout }} - sprawdź listen_addresses w {{ pg_conf_dir }}/postgresql.conf.
+        success_msg: "PostgreSQL słucha na {{ gwbridge_gateway }}:5432"
 
   handlers:
     - name: Zrestartuj PostgreSQL

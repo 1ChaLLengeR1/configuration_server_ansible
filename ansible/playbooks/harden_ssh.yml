@@ -2,31 +2,86 @@
 # UWAGA: uruchamiaj TYLKO po potwierdzeniu, że logowanie jako docelowy użytkownik
 # (SERVER_USER_1) kluczem SSH działa (np. `make verify-user`). Ten playbook wyłącza
 # logowanie hasłem i logowanie roota — błędna konfiguracja klucza wcześniej = brak dostępu do serwera.
+#
+# Debian/Ubuntu z cloud-init (obrazy VPS, np. OVH): `sshd_config` dołącza na początku
+# `Include /etc/ssh/sshd_config.d/*.conf`, a sshd bierze PIERWSZĄ napotkaną wartość opcji.
+# Plik `50-cloud-init.conf` z `PasswordAuthentication yes` wygrywa więc z `no` w głównym pliku.
+# Dlatego ustawienia lądują w `00-hardening.conf` (wczytywany jako pierwszy), cloud-init
+# dostaje `no`, a na końcu sprawdzamy WYNIKOWĄ konfigurację (`sshd -T`), nie same pliki.
 - name: Wyłącz logowanie root i hasłem przez SSH
   hosts: all
   become: true
 
   tasks:
-    - name: Wyłącz logowanie root przez SSH
+    - name: Ustawienia SSH w pliku wczytywanym jako pierwszy (00-hardening.conf)
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-hardening.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Zarządzane przez Ansible (configuration_server_ansible, harden_ssh.yml)
+          PermitRootLogin no
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
+      notify: Restart sshd
+
+    - name: Sprawdź, czy istnieje plik cloud-init z ustawieniami SSH
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d/50-cloud-init.conf
+      register: cloud_init_sshd
+
+    - name: Wyłącz logowanie hasłem także w pliku cloud-init
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/50-cloud-init.conf
+        regexp: '^#?\s*PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+      when: cloud_init_sshd.stat.exists
+      notify: Restart sshd
+
+    - name: Wyłącz logowanie root przez SSH (sshd_config)
       ansible.builtin.lineinfile:
         path: /etc/ssh/sshd_config
         regexp: '^#?\s*PermitRootLogin'
         line: 'PermitRootLogin no'
       notify: Restart sshd
 
-    - name: Wyłącz logowanie hasłem przez SSH
+    - name: Wyłącz logowanie hasłem przez SSH (sshd_config)
       ansible.builtin.lineinfile:
         path: /etc/ssh/sshd_config
         regexp: '^#?\s*PasswordAuthentication'
         line: 'PasswordAuthentication no'
       notify: Restart sshd
 
-    - name: Upewnij się, że logowanie kluczem jest włączone
+    - name: Upewnij się, że logowanie kluczem jest włączone (sshd_config)
       ansible.builtin.lineinfile:
         path: /etc/ssh/sshd_config
         regexp: '^#?\s*PubkeyAuthentication'
         line: 'PubkeyAuthentication yes'
       notify: Restart sshd
+
+    # Błąd składni w konfiguracji + restart = sshd nie wstaje = brak dostępu. Test przed restartem.
+    - name: Sprawdź poprawność konfiguracji sshd (sshd -t)
+      ansible.builtin.command: sshd -t
+      changed_when: false
+
+    - name: Zastosuj zmiany (restart sshd)
+      ansible.builtin.meta: flush_handlers
+
+    - name: Odczytaj wynikową konfigurację sshd (sshd -T)
+      ansible.builtin.command: sshd -T
+      register: sshd_effective
+      changed_when: false
+
+    - name: Upewnij się, że root i hasła są faktycznie wyłączone
+      ansible.builtin.assert:
+        that:
+          - "'permitrootlogin no' in sshd_effective.stdout_lines"
+          - "'passwordauthentication no' in sshd_effective.stdout_lines"
+          - "'pubkeyauthentication yes' in sshd_effective.stdout_lines"
+        fail_msg: "Wynikowa konfiguracja sshd nadal pozwala na root/hasła — sprawdź pliki w /etc/ssh/sshd_config.d/."
+        success_msg: "SSH: tylko klucze, bez roota."
 
   handlers:
     - name: Restart sshd

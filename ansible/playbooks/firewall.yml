@@ -1,0 +1,155 @@
+---
+# ufw (zapora hosta) + fail2ban (blokowanie prób zgadywania haseł SSH).
+#
+# UWAGA: ufw NIE filtruje portów publikowanych przez Dockera (Docker pisze własne reguły
+# iptables przed ufw). Porty kontenerów (np. 80/443 Traefika) ogranicza się w łańcuchu
+# DOCKER-USER (w TreeT: CD, faza E), nie tutaj. Ten playbook chroni porty usług HOSTA:
+# SSH, Swarm, WireGuard, PostgreSQL.
+#
+# Kolejność w playbooku jest celowa: najpierw reguła SSH, dopiero potem włączenie ufw —
+# odwrotnie = odcięty dostęp. Zmienne z .env (wszystkie opcjonalne):
+#   SSH_ALLOWED_FROM_1   - lista IP/podsieci po przecinku, z których wolno SSH (pusta = z każdego)
+#   WG_SUBNET_1          - podsieć WireGuarda (porty Swarma tylko z niej), domyślnie 10.99.0.0/24
+#   WG_PEER_PUBLIC_IPS_1 - publiczne IP pozostałych węzłów (WireGuard 51820/udp tylko od nich)
+- name: Skonfiguruj zaporę (ufw) i fail2ban
+  hosts: all
+  become: true
+  vars:
+    ssh_allowed_from: "{{ lookup('env', 'SSH_ALLOWED_FROM_1') | split(',') | map('trim') | select | list }}"
+    wg_subnet: "{{ lookup('env', 'WG_SUBNET_1') | default('10.99.0.0/24', true) }}"
+    wg_port: 51820
+    wg_peer_public_ips: "{{ lookup('env', 'WG_PEER_PUBLIC_IPS_1') | split(',') | map('trim') | select | list }}"
+
+  tasks:
+    # Logowanie na serwer TYLKO kluczem SSH (bez haseł, bez roota) ustawia harden_ssh.yml - ufw działa
+    # na poziomie sieci i nie rozróżnia hasła od klucza. Tu tylko twardy warunek: zapory nie stawiamy
+    # na serwerze, na który da się wejść hasłem. Celowo bez automatycznego wyłączania haseł - harden-ssh
+    # odpala się dopiero po `make verify-user` (inaczej zły klucz = brak dostępu do serwera).
+    - name: Odczytaj wynikową konfigurację sshd (sshd -T)
+      ansible.builtin.command: sshd -T
+      register: sshd_effective
+      changed_when: false
+
+    - name: Wymagaj logowania tylko kluczem SSH (bez haseł i bez roota)
+      ansible.builtin.assert:
+        that:
+          - "'passwordauthentication no' in sshd_effective.stdout_lines"
+          - "'kbdinteractiveauthentication no' in sshd_effective.stdout_lines"
+          - "'permitrootlogin no' in sshd_effective.stdout_lines"
+          - "'pubkeyauthentication yes' in sshd_effective.stdout_lines"
+        fail_msg: >
+          SSH nadal pozwala na logowanie hasłem albo na roota. Najpierw `make verify-user`
+          (logowanie kluczem działa), potem `make harden-ssh`, i dopiero wtedy `make install-firewall`.
+        success_msg: "SSH: logowanie tylko kluczem, bez roota - OK."
+
+    - name: Zainstaluj ufw, fail2ban i python3-systemd (fail2ban czyta journald)
+      ansible.builtin.apt:
+        name:
+          - ufw
+          - fail2ban
+          - python3-systemd
+        state: present
+        update_cache: true
+
+    # --- ufw ---
+    - name: SSH z każdego adresu (SSH_ALLOWED_FROM_1 puste)
+      community.general.ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+        comment: ssh
+      when: ssh_allowed_from | length == 0
+
+    - name: SSH tylko z SSH_ALLOWED_FROM_1
+      community.general.ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+        from_ip: "{{ item }}"
+        comment: ssh
+      loop: "{{ ssh_allowed_from }}"
+
+    - name: HTTP i HTTPS (Traefik)
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+        comment: http/https
+      loop: [ "80", "443" ]
+
+    - name: Porty Docker Swarm tylko z podsieci WireGuarda (2377/tcp, 7946/tcp+udp, 4789/udp)
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.port }}"
+        proto: "{{ item.proto }}"
+        from_ip: "{{ wg_subnet }}"
+        comment: swarm-over-wireguard
+      loop:
+        - { port: "2377", proto: tcp }
+        - { port: "7946", proto: tcp }
+        - { port: "7946", proto: udp }
+        - { port: "4789", proto: udp }
+
+    - name: WireGuard tylko od publicznych IP pozostałych węzłów (WG_PEER_PUBLIC_IPS_1)
+      community.general.ufw:
+        rule: allow
+        port: "{{ wg_port | string }}"
+        proto: udp
+        from_ip: "{{ item }}"
+        comment: wireguard
+      loop: "{{ wg_peer_public_ips }}"
+
+    # Kontenery Swarma łączą się z natywnym PostgreSQL przez docker_gwbridge (ruch do hosta = INPUT).
+    - name: PostgreSQL z kontenerów Swarma (interfejs docker_gwbridge)
+      community.general.ufw:
+        rule: allow
+        interface: docker_gwbridge
+        direction: in
+        port: "5432"
+        proto: tcp
+        comment: postgres-from-swarm
+
+    - name: Domyślnie blokuj ruch przychodzący, przepuszczaj wychodzący i włącz ufw
+      community.general.ufw:
+        state: enabled
+        default: "{{ item.policy }}"
+        direction: "{{ item.direction }}"
+      loop:
+        - { policy: deny, direction: incoming }
+        - { policy: allow, direction: outgoing }
+
+    # --- fail2ban ---
+    # Debian 12+ nie ma /var/log/auth.log (logi SSH tylko w journald) - bez `backend = systemd`
+    # jail sshd nie widzi żadnych prób logowania.
+    - name: Konfiguracja fail2ban (jail sshd na journald, rosnący czas bana)
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.local
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Zarządzane przez Ansible (configuration_server_ansible, firewall.yml)
+          [DEFAULT]
+          banaction = ufw
+          bantime = 1h
+          bantime.increment = true
+          bantime.maxtime = 1w
+          findtime = 10m
+          maxretry = 5
+
+          [sshd]
+          enabled = true
+          backend = systemd
+      notify: Restart fail2ban
+
+    - name: Upewnij się, że fail2ban działa i jest włączony na starcie
+      ansible.builtin.service:
+        name: fail2ban
+        state: started
+        enabled: true
+
+  handlers:
+    - name: Restart fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        state: restarted

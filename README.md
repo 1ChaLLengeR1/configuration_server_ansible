@@ -27,7 +27,10 @@ tworzenie użytkowników, hardening SSH.
         ├── harden_ssh.yml          # wyłącza root/hasła w SSH
         ├── docker_swarm.yml        # instaluje Docker CE + docker swarm init
         ├── postgresql.yml          # instaluje PostgreSQL + rolę deploy (CREATEDB) dla Swarm
-        └── add_user.yml            # dodaje kolejnego usera (NEW_USER_*) + weryfikuje logowanie SSH
+        ├── add_user.yml            # dodaje kolejnego usera (NEW_USER_*) + weryfikuje logowanie SSH
+        ├── firewall.yml            # ufw + fail2ban
+        ├── wireguard.yml           # tunel WireGuard wg0 (Swarm między serwerami tylko w tunelu)
+        └── swarm_wireguard.yml     # Docker Swarm na adresie WireGuarda + etykiety węzła
 ```
 
 ## Krok 1 — `.env` w katalogu głównym
@@ -286,3 +289,48 @@ danych. Mogą mieć tę samą nazwę i różne hasła, nie mają ze sobą nic ws
 | `make install-docker-swarm` | zainstaluj Docker CE + `docker swarm init` (`playbooks/docker_swarm.yml`) |
 | `make install-postgresql` | zainstaluj PostgreSQL + skonfiguruj dostęp dla Swarm + rolę `deploy` z `CREATEDB` (`playbooks/postgresql.yml`) |
 | `make add-user` | dodaj kolejnego usera z `NEW_USER_*` + klucz + weryfikacja logowania SSH (`playbooks/add_user.yml`) |
+
+## Krok 8 — zapora, fail2ban, WireGuard i Swarm na adresie WG
+
+Dla serwera, który ma kiedyś dostać kolejny węzeł Swarma (np. VM w innej chmurze). Ruch Swarma między
+serwerami (zarządzanie, sieci overlay/VXLAN, baza, broker) idzie wtedy wyłącznie szyfrowanym tunelem
+WireGuard. Swarm warto mieć na adresie WG **od początku** — przeniesienie Swarma z działającymi
+serwisami wymaga resetu (utrata sieci, sekretów, configów i etykiet).
+
+1. Dopisz do `.env` (wszystko opcjonalne — w nawiasie wartości domyślne):
+
+   ```env
+   SSH_ALLOWED_FROM_1=            # IP/podsieci po przecinku, z których wolno SSH (puste = z każdego)
+   WG_ADDRESS_1=10.99.0.1/24      # adres tego węzła w tunelu (10.99.0.1/24)
+   WG_SUBNET_1=10.99.0.0/24       # podsieć tunelu - porty Swarma tylko z niej (10.99.0.0/24)
+   WG_PEER_PUBLIC_IPS_1=          # publiczne IP pozostałych węzłów (WireGuard 51820/udp tylko od nich)
+   SWARM_ADDR_POOL_1=10.20.0.0/16 # pula adresów sieci overlay (10.20.0.0/16)
+   SWARM_NODE_LABELS_1=           # etykiety węzła po przecinku, np. treet.stateful=true
+   ```
+
+   i zrób `make down && make build && make up` (obraz dostał kolekcję `community.general` dla ufw).
+
+2. Kolejność:
+
+   ```
+   make harden-ssh          # tylko klucze SSH (także na obrazach z cloud-init)
+   make install-firewall    # ufw + fail2ban
+   make install-wireguard   # wg0 + Docker startuje po wg0; wypisuje klucz publiczny
+   make swarm-wireguard     # Swarm na adresie WG (reset tylko pustego, jednowęzłowego Swarma)
+   make install-postgresql  # ponownie: listen na docker_gwbridge + PostgreSQL startuje po Dockerze
+   ```
+
+3. Sprawdzenie po **restarcie serwera** (`sudo reboot`): `ip -br addr show wg0`, `sudo docker info`
+   (`NodeAddr` = adres WG), `sudo ss -ltnp | grep 5432` (localhost i gateway `docker_gwbridge`),
+   `sudo ufw status verbose`, `sudo fail2ban-client status sshd`.
+
+Uwagi:
+- **`install-firewall` wymaga wcześniejszego `harden-ssh`** — na starcie sprawdza `sshd -T` i przerywa,
+  jeśli da się zalogować hasłem albo na roota (logowanie tylko kluczem ustawia `harden_ssh.yml`).
+- **ufw nie filtruje portów publikowanych przez Dockera** (np. 80/443 Traefika) — te ogranicza się
+  w łańcuchu `DOCKER-USER`, osobno.
+- **`harden_ssh.yml` na obrazach z cloud-init**: `sshd_config.d/50-cloud-init.conf` z
+  `PasswordAuthentication yes` wygrywał z `no` w `sshd_config` (sshd bierze pierwszą wartość) —
+  playbook zapisuje teraz ustawienia w `00-hardening.conf` i sprawdza wynik przez `sshd -T`.
+- Kolejny węzeł: na nim `create-user` … `install-wireguard` z `WG_ADDRESS_1=10.99.0.2/24`, peery po
+  obu stronach przez zmienną `wg_peers` (opis w `wireguard.yml`), potem `docker swarm join` po adresach WG.
