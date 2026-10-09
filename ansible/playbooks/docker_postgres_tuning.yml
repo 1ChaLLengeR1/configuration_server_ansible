@@ -1,0 +1,168 @@
+---
+# Limity logów (Docker, journald) i strojenie PostgreSQL pod pamięć serwera.
+#
+# UWAGA - krótka przerwa w działaniu:
+#   - zmiana /etc/docker/daemon.json wymaga restartu Dockera = restart WSZYSTKICH kontenerów (Swarm nie
+#     wspiera live-restore). Limit logów działa dla kontenerów tworzonych PO zmianie (redeploy stacka).
+#   - shared_buffers wymaga restartu PostgreSQL (kilka sekund niedostępności bazy).
+# Restart następuje tylko, gdy konfiguracja faktycznie się zmieniła. Na produkcji z ruchem - w oknie
+# serwisowym.
+#
+# Docker: logi kontenerów domyślnie BEZ limitu - gadatliwy kontener potrafi zapełnić dysk (wtedy staje
+# wszystko, łącznie z bazą). Limit: DOCKER_LOG_MAX_SIZE_1 x DOCKER_LOG_MAX_FILE_1 na kontener.
+#
+# PostgreSQL (wartości domyślne pod serwer 12 GB RAM, na którym obok bazy chodzą kontenery aplikacji -
+# baza dostaje ~3 GB; przy innym serwerze nadpisz w .env):
+#   PG_SHARED_BUFFERS_1 (2GB), PG_EFFECTIVE_CACHE_SIZE_1 (6GB), PG_MAINTENANCE_WORK_MEM_1 (512MB),
+#   PG_WORK_MEM_1 (16MB), PG_MAX_CONNECTIONS_1 (100)
+- name: Limity logów (Docker, journald) i strojenie PostgreSQL
+  hosts: all
+  become: true
+  vars:
+    docker_log_max_size: "{{ lookup('env', 'DOCKER_LOG_MAX_SIZE_1') | default('20m', true) }}"
+    docker_log_max_file: "{{ lookup('env', 'DOCKER_LOG_MAX_FILE_1') | default('5', true) }}"
+    journald_max_use: "{{ lookup('env', 'JOURNALD_MAX_USE_1') | default('1G', true) }}"
+    pg_shared_buffers: "{{ lookup('env', 'PG_SHARED_BUFFERS_1') | default('2GB', true) }}"
+    pg_effective_cache_size: "{{ lookup('env', 'PG_EFFECTIVE_CACHE_SIZE_1') | default('6GB', true) }}"
+    pg_maintenance_work_mem: "{{ lookup('env', 'PG_MAINTENANCE_WORK_MEM_1') | default('512MB', true) }}"
+    pg_work_mem: "{{ lookup('env', 'PG_WORK_MEM_1') | default('16MB', true) }}"
+    pg_max_connections: "{{ lookup('env', 'PG_MAX_CONNECTIONS_1') | default('100', true) }}"
+
+  tasks:
+    # --- Docker: rotacja logów ---
+    - name: Odczytaj obecny /etc/docker/daemon.json (jeśli istnieje)
+      ansible.builtin.slurp:
+        src: /etc/docker/daemon.json
+      register: docker_daemon_current
+      failed_when: false
+
+    # Scalenie z istniejącą konfiguracją - inne ustawienia daemon.json zostają nietknięte.
+    - name: Rotacja logów kontenerów w daemon.json (json-file, {{ docker_log_max_size }} x {{ docker_log_max_file }})
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        mode: "0644"
+        content: >-
+          {{ ((docker_daemon_current.content | default('e30=') | b64decode | from_json)
+              | combine({'log-driver': 'json-file',
+                         'log-opts': {'max-size': docker_log_max_size, 'max-file': docker_log_max_file | string}}))
+             | to_nice_json }}
+      notify: Zrestartuj Docker
+
+    # --- journald ---
+    - name: Katalog drop-in journald
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        mode: "0755"
+
+    - name: Limit miejsca na logi systemowe (journald {{ journald_max_use }})
+      ansible.builtin.copy:
+        dest: /etc/systemd/journald.conf.d/size.conf
+        mode: "0644"
+        content: |
+          # Zarządzane przez Ansible (configuration_server_ansible, docker_postgres_tuning.yml)
+          [Journal]
+          SystemMaxUse={{ journald_max_use }}
+      notify: Zrestartuj journald
+
+    # --- PostgreSQL ---
+    - name: Znajdź postgresql.conf aktywnego klastra
+      ansible.builtin.find:
+        paths: /etc/postgresql
+        patterns: "postgresql.conf"
+        recurse: true
+      register: pg_conf_find
+
+    - name: Przerwij, jeśli nie znaleziono postgresql.conf
+      ansible.builtin.fail:
+        msg: "Nie znaleziono postgresql.conf pod /etc/postgresql - najpierw `make install-postgresql`."
+      when: pg_conf_find.matched == 0
+
+    - name: Ustal katalog konfiguracyjny klastra
+      ansible.builtin.set_fact:
+        pg_conf_dir: "{{ pg_conf_find.files[0].path | dirname }}"
+
+    # Debian dołącza conf.d na końcu postgresql.conf (include_dir) - nasz plik nadpisuje wartości
+    # domyślne bez edycji głównego pliku.
+    - name: Upewnij się, że postgresql.conf wczytuje conf.d
+      ansible.builtin.lineinfile:
+        path: "{{ pg_conf_dir }}/postgresql.conf"
+        regexp: "^#?\\s*include_dir\\s*="
+        line: "include_dir = 'conf.d'"
+      notify: Zrestartuj PostgreSQL
+
+    - name: Katalog conf.d klastra
+      ansible.builtin.file:
+        path: "{{ pg_conf_dir }}/conf.d"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: "0755"
+
+    - name: Strojenie PostgreSQL (pamięć, dysk SSD, WAL)
+      ansible.builtin.copy:
+        dest: "{{ pg_conf_dir }}/conf.d/90-tuning.conf"
+        owner: postgres
+        group: postgres
+        mode: "0644"
+        content: |
+          # Zarządzane przez Ansible (configuration_server_ansible, docker_postgres_tuning.yml)
+          max_connections = {{ pg_max_connections }}
+          shared_buffers = {{ pg_shared_buffers }}
+          effective_cache_size = {{ pg_effective_cache_size }}
+          maintenance_work_mem = {{ pg_maintenance_work_mem }}
+          work_mem = {{ pg_work_mem }}
+          # dysk SSD/NVMe (VPS) - losowy odczyt prawie tak tani jak sekwencyjny
+          random_page_cost = 1.1
+          effective_io_concurrency = 200
+          # rzadsze, rozłożone w czasie checkpointy
+          checkpoint_completion_target = 0.9
+          max_wal_size = 2GB
+          min_wal_size = 512MB
+          wal_compression = on
+      notify: Zrestartuj PostgreSQL
+
+    - name: Zastosuj zmiany (restarty tylko przy zmianie konfiguracji)
+      ansible.builtin.meta: flush_handlers
+
+    # --- weryfikacja ---
+    - name: Odczytaj ustawienia PostgreSQL po zmianach
+      become_user: postgres
+      ansible.builtin.command: >-
+        psql -XAtc "select name || '=' || current_setting(name) from pg_settings
+        where name in ('shared_buffers','effective_cache_size','work_mem','maintenance_work_mem','max_connections')
+        order by name"
+      register: pg_settings
+      changed_when: false
+
+    - name: Odczytaj ustawienia logów Dockera
+      ansible.builtin.command:
+        cmd: >-
+          docker info --format '{% raw %}{{.LoggingDriver}}{% endraw %}'
+      register: docker_logging
+      changed_when: false
+
+    - name: Podsumowanie
+      ansible.builtin.debug:
+        msg:
+          - "Docker: driver logów {{ docker_logging.stdout }}, limit {{ docker_log_max_size }} x {{ docker_log_max_file }} (nowe kontenery)"
+          - "PostgreSQL: {{ pg_settings.stdout_lines | join(', ') }}"
+
+  handlers:
+    # PostgreSQL słucha na gateway docker_gwbridge - po restarcie Dockera restartujemy też bazę, żeby
+    # na pewno trzymała ten adres (handler PostgreSQL zdefiniowany niżej = wykona się po Dockerze).
+    - name: Zrestartuj Docker
+      ansible.builtin.service:
+        name: docker
+        state: restarted
+      notify: Zrestartuj PostgreSQL
+
+    - name: Zrestartuj journald
+      ansible.builtin.service:
+        name: systemd-journald
+        state: restarted
+
+    - name: Zrestartuj PostgreSQL
+      ansible.builtin.service:
+        name: postgresql
+        state: restarted

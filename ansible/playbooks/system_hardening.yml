@@ -1,0 +1,266 @@
+---
+# Hardening systemu po bazowej konfiguracji (create-user, harden-ssh, install-firewall):
+#   - automatyczne aktualizacje bezpieczeństwa (unattended-upgrades) BEZ automatycznego restartu serwera,
+#   - swap (bufor przy braku RAM - zamiast ubijania procesów, np. PostgreSQL) + vm.swappiness,
+#   - synchronizacja czasu (tokeny JWT, np. Clerk, mają ważność co do sekundy),
+#   - dodatkowe limity SSH (AllowUsers, MaxAuthTries, LoginGraceTime),
+#   - twardsze ustawienia sieci jądra (sysctl) - bez ruszania ip_forward i rp_filter=strict (Docker/WireGuard),
+#   - blokada nieużywanych kont (np. domyślne `debian` z obrazu VPS),
+#   - locale (pl_PL.UTF-8 + en_US.UTF-8) - koniec ostrzeżeń `perl: warning: Setting locale failed`.
+#
+# Zmienne z .env (wszystkie opcjonalne):
+#   SWAP_SIZE_1        - rozmiar pliku swap, domyślnie 4G (pusty = bez zmian, istniejący swap zostaje)
+#   SSH_ALLOW_USERS_1  - konta, które mogą logować się przez SSH, po spacji (np. "artur deploy");
+#                        puste = bez AllowUsers. SERVER_USER_1 MUSI być na liście (inaczej playbook przerwie).
+#   LOCK_USERS_1       - konta do zablokowania po przecinku, domyślnie debian
+- name: Hardening systemu (aktualizacje, swap, czas, SSH, sysctl, konta, locale)
+  hosts: all
+  become: true
+  vars:
+    swap_size: "{{ lookup('env', 'SWAP_SIZE_1') | default('4G', true) }}"
+    swap_file: /swapfile
+    ssh_allow_users: "{{ lookup('env', 'SSH_ALLOW_USERS_1') | split(' ') | map('trim') | select | list }}"
+    lock_users: "{{ lookup('env', 'LOCK_USERS_1') | default('debian', true) | split(',') | map('trim') | select | list }}"
+    ansible_login_user: "{{ lookup('env', 'SERVER_USER_1') }}"
+
+  tasks:
+    # --- automatyczne aktualizacje bezpieczeństwa ---
+    - name: Zainstaluj unattended-upgrades
+      ansible.builtin.apt:
+        name:
+          - unattended-upgrades
+          - apt-listchanges
+        state: present
+        update_cache: true
+
+    - name: Włącz codzienne odświeżanie list pakietów i automatyczne aktualizacje
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        mode: "0644"
+        content: |
+          // Zarządzane przez Ansible (configuration_server_ansible, system_hardening.yml)
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+          APT::Periodic::AutocleanInterval "7";
+
+    # Źródła aktualizacji zostają domyślne Debiana (m.in. Debian-Security). Repo Dockera nie jest na
+    # liście - Docker aktualizujemy świadomie, bo jego restart restartuje kontenery produkcji.
+    - name: Bez automatycznego restartu serwera, sprzątanie starych zależności
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/52unattended-upgrades-local
+        mode: "0644"
+        content: |
+          // Zarządzane przez Ansible (configuration_server_ansible, system_hardening.yml)
+          Unattended-Upgrade::Automatic-Reboot "false";
+          Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+          Unattended-Upgrade::Remove-Unused-Dependencies "true";
+
+    - name: Upewnij się, że unattended-upgrades działa
+      ansible.builtin.service:
+        name: unattended-upgrades
+        state: started
+        enabled: true
+
+    # --- swap ---
+    - name: Sprawdź aktywny swap
+      ansible.builtin.command: swapon --show --noheadings
+      register: swap_active
+      changed_when: false
+
+    - name: Utwórz plik swap ({{ swap_size }})
+      ansible.builtin.shell: |
+        set -euo pipefail
+        fallocate -l {{ swap_size }} {{ swap_file }}
+        chmod 600 {{ swap_file }}
+        mkswap {{ swap_file }}
+        swapon {{ swap_file }}
+      args:
+        executable: /bin/bash
+        creates: "{{ swap_file }}"
+      when: swap_size and swap_active.stdout | trim == ''
+
+    - name: Swap montowany po restarcie (fstab)
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^{{ swap_file }}\s'
+        line: "{{ swap_file }} none swap sw 0 0"
+      when: swap_size and swap_active.stdout | trim == ''
+
+    # --- sysctl: swap + sieć ---
+    - name: Ustawienia jądra (swappiness, ochrona sieci)
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/90-hardening.conf
+        mode: "0644"
+        content: |
+          # Zarządzane przez Ansible (configuration_server_ansible, system_hardening.yml)
+          # Swap tylko w ostateczności (RAM dla PostgreSQL i kontenerów).
+          vm.swappiness = 10
+          # Ochrona przed zalewem SYN.
+          net.ipv4.tcp_syncookies = 1
+          # Bez przekierowań ICMP i source routingu (serwer nie jest routerem dla obcych).
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.default.accept_redirects = 0
+          net.ipv6.conf.all.accept_redirects = 0
+          net.ipv6.conf.default.accept_redirects = 0
+          net.ipv4.conf.all.send_redirects = 0
+          net.ipv4.conf.default.send_redirects = 0
+          net.ipv4.conf.all.accept_source_route = 0
+          net.ipv6.conf.all.accept_source_route = 0
+          net.ipv4.icmp_echo_ignore_broadcasts = 1
+          # Wycieki adresów jądra dla zwykłych użytkowników.
+          kernel.kptr_restrict = 2
+          kernel.dmesg_restrict = 1
+          # Celowo bez zmian: net.ipv4.ip_forward (wymagany przez Dockera) i rp_filter (tryb strict
+          # psuje ruch overlay/WireGuard).
+      register: sysctl_conf
+
+    - name: Zastosuj ustawienia jądra
+      ansible.builtin.command: sysctl --system
+      when: sysctl_conf.changed
+
+    # --- czas ---
+    - name: Odczytaj listę usług (czy jest chrony)
+      ansible.builtin.service_facts:
+
+    - name: Zainstaluj systemd-timesyncd (jeśli nie ma chrony)
+      ansible.builtin.apt:
+        name: systemd-timesyncd
+        state: present
+      when: "'chrony.service' not in ansible_facts.services"
+
+    - name: Upewnij się, że synchronizacja czasu działa
+      ansible.builtin.service:
+        name: "{{ 'chrony' if 'chrony.service' in ansible_facts.services else 'systemd-timesyncd' }}"
+        state: started
+        enabled: true
+
+    - name: Strefa czasowa UTC (logi i cron spójne między serwerami)
+      ansible.builtin.command: timedatectl set-timezone UTC
+      changed_when: false
+
+    # --- SSH: limity ---
+    - name: Przerwij, jeśli AllowUsers odciąłby użytkownika Ansible ({{ ansible_login_user }})
+      ansible.builtin.fail:
+        msg: >
+          SSH_ALLOW_USERS_1 ({{ ssh_allow_users | join(' ') }}) nie zawiera SERVER_USER_1
+          ({{ ansible_login_user }}) - po restarcie sshd nie dałoby się zalogować.
+      when: ssh_allow_users | length > 0 and ansible_login_user not in ssh_allow_users
+
+    - name: Limity SSH (01-limits.conf, wczytywany zaraz po 00-hardening.conf)
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/01-limits.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Zarządzane przez Ansible (configuration_server_ansible, system_hardening.yml)
+          MaxAuthTries 3
+          LoginGraceTime 30
+          X11Forwarding no
+          {% if ssh_allow_users | length > 0 %}
+          AllowUsers {{ ssh_allow_users | join(' ') }}
+          {% endif %}
+      register: ssh_limits
+
+    - name: Sprawdź poprawność konfiguracji sshd (sshd -t)
+      ansible.builtin.command: sshd -t
+      changed_when: false
+
+    - name: Zrestartuj sshd po zmianie limitów
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+      when: ssh_limits.changed
+
+    # --- konta ---
+    - name: Odczytaj konta systemowe
+      ansible.builtin.getent:
+        database: passwd
+
+    - name: Zablokuj nieużywane konta (hasło i powłoka) - tylko istniejące, nigdy użytkownika Ansible
+      ansible.builtin.user:
+        name: "{{ item }}"
+        password_lock: true
+        shell: /usr/sbin/nologin
+      loop: "{{ lock_users }}"
+      when:
+        - item != ansible_login_user
+        - item in ansible_facts.getent_passwd
+
+    # --- systemd-resolved: bez LLMNR/mDNS ---
+    # Domyślnie systemd-resolved nasłuchuje publicznie na 5355 (LLMNR) - rozgłaszanie nazw w sieci
+    # lokalnej, zbędne na serwerze (ufw i tak blokuje, ale lepiej, żeby port w ogóle nie był otwarty).
+    - name: Katalog drop-in systemd-resolved
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d
+        state: directory
+        mode: "0755"
+      when: "'systemd-resolved.service' in ansible_facts.services"
+
+    - name: Wyłącz LLMNR i mDNS w systemd-resolved
+      ansible.builtin.copy:
+        dest: /etc/systemd/resolved.conf.d/no-llmnr.conf
+        mode: "0644"
+        content: |
+          # Zarządzane przez Ansible (configuration_server_ansible, system_hardening.yml)
+          [Resolve]
+          LLMNR=no
+          MulticastDNS=no
+      register: resolved_conf
+      when: "'systemd-resolved.service' in ansible_facts.services"
+
+    - name: Zrestartuj systemd-resolved po zmianie
+      ansible.builtin.service:
+        name: systemd-resolved
+        state: restarted
+      when: resolved_conf is changed
+
+    # cloud-init daje domyślnemu kontu obrazu (np. `debian`) sudo BEZ hasła (/etc/sudoers.d/90-cloud-init-users).
+    # Zablokowane konto i tak się nie zaloguje, ale odblokowanie go = natychmiastowy root - usuwamy regułę.
+    - name: Znajdź pliki sudoers z regułami dla blokowanych kont
+      ansible.builtin.find:
+        paths: /etc/sudoers.d
+        contains: '^\s*({{ lock_users | join("|") }})\s'
+        use_regex: true
+      register: sudoers_locked
+      when: lock_users | length > 0
+
+    - name: Usuń sudo dla zablokowanych kont (z walidacją visudo)
+      ansible.builtin.lineinfile:
+        path: "{{ item.0.path }}"
+        regexp: '^\s*{{ item.1 }}\s'
+        state: absent
+        validate: visudo -cf %s
+      loop: "{{ (sudoers_locked.files | default([])) | product(lock_users | reject('equalto', ansible_login_user) | list) | list }}"
+      loop_control:
+        label: "{{ item.0.path }}: {{ item.1 }}"
+
+    # --- locale ---
+    - name: Zainstaluj pakiet locales
+      ansible.builtin.apt:
+        name: locales
+        state: present
+
+    - name: Wygeneruj locale pl_PL.UTF-8 i en_US.UTF-8
+      community.general.locale_gen:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - pl_PL.UTF-8
+        - en_US.UTF-8
+
+    # --- podsumowanie ---
+    - name: Odczytaj stan (swap, czas, aktualizacje)
+      ansible.builtin.shell: |
+        echo "swap: $(swapon --show --noheadings --bytes | awk '{printf "%s %.1fG", $1, $3/1024/1024/1024}')"
+        echo "czas: $(timedatectl show -p NTPSynchronized --value) (NTPSynchronized), strefa $(timedatectl show -p Timezone --value)"
+        echo "unattended-upgrades: $(systemctl is-active unattended-upgrades)"
+        echo "ssh: $(sshd -T | grep -E '^(allowusers|maxauthtries|logingracetime) ' | tr '\n' ';')"
+      args:
+        executable: /bin/bash
+      register: hardening_state
+      changed_when: false
+
+    - name: Podsumowanie
+      ansible.builtin.debug:
+        msg: "{{ hardening_state.stdout_lines }}"

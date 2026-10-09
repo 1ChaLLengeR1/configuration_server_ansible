@@ -1,0 +1,85 @@
+---
+# Audyt serwera - TYLKO ODCZYT, nic nie zmienia (skrypt ansible/files/audit.sh).
+# Sprawdza: system (aktualizacje, czas, swap, dysk, logi, sysctl), konta, SSH, zaporę (ufw, fail2ban,
+# porty publiczne, DOCKER-USER), WireGuard, Docker/Swarm (adres WG, etykiety, MTU sieci, limity logów),
+# PostgreSQL (adresy, pg_hba, superuserzy, strojenie, baza i rozszerzenia, kopia na hoście).
+#
+# Wynik: podsumowanie w konsoli + raport Markdown na Twoim komputerze:
+#   ansible/reports/audit_<host>_<data>.md   (katalog w .gitignore)
+# Playbook kończy się błędem, jeśli jest choć jedno FAIL (luka/brak) - WARN tylko raportuje.
+#
+# Zmienne z .env (opcjonalne, wspólne z innymi playbookami):
+#   WG_ADDRESS_1 (10.99.0.1/24), SWARM_NODE_LABELS_1 (pierwsza etykieta), LOCK_USERS_1 (debian),
+#   AUDIT_DB_NAME_1 (treet), AUDIT_DB_EXTENSIONS_1 ("unaccent uuid-ossp"),
+#   AUDIT_PUBLIC_PORTS_1 ("22 80 443 51820") - porty, które MOGĄ nasłuchiwać publicznie
+- name: Audyt serwera (tylko odczyt)
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    wg_ip: "{{ (lookup('env', 'WG_ADDRESS_1') | default('10.99.0.1/24', true)).split('/')[0] }}"
+    swarm_label: "{{ (lookup('env', 'SWARM_NODE_LABELS_1') | split(',') | map('trim') | select | list + [''])[0] }}"
+    report_dir: /ansible/reports
+
+  tasks:
+    - name: Uruchom audyt (ansible/files/audit.sh)
+      ansible.builtin.script: ../files/audit.sh
+      args:
+        executable: /bin/bash
+      environment:
+        AUDIT_WG_IP: "{{ wg_ip }}"
+        AUDIT_SWARM_LABEL: "{{ swarm_label }}"
+        AUDIT_LOCK_USERS: "{{ lookup('env', 'LOCK_USERS_1') | default('debian', true) | replace(',', ' ') }}"
+        AUDIT_DB_NAME: "{{ lookup('env', 'AUDIT_DB_NAME_1') | default('treet', true) }}"
+        AUDIT_DB_EXTENSIONS: "{{ lookup('env', 'AUDIT_DB_EXTENSIONS_1') | default('unaccent uuid-ossp', true) }}"
+        AUDIT_PUBLIC_PORTS: "{{ lookup('env', 'AUDIT_PUBLIC_PORTS_1') | default('22 80 443 51820', true) }}"
+      register: audit_raw
+      changed_when: false
+
+    - name: Rozbierz wyniki (STATUS|KATEGORIA|SPRAWDZENIE|SZCZEGÓŁY)
+      ansible.builtin.set_fact:
+        audit_rows: >-
+          {{ audit_raw.stdout_lines
+             | select('match', '^(OK|WARN|FAIL|INFO)\|')
+             | map('split', '|', 3)
+             | map('zip', ['status', 'category', 'check', 'details'])
+             | map('map', 'reverse')
+             | map('community.general.dict')
+             | list }}
+
+    - name: Zlicz wyniki
+      ansible.builtin.set_fact:
+        audit_fail: "{{ audit_rows | selectattr('status', 'equalto', 'FAIL') | list }}"
+        audit_warn: "{{ audit_rows | selectattr('status', 'equalto', 'WARN') | list }}"
+        audit_ok: "{{ audit_rows | selectattr('status', 'equalto', 'OK') | list }}"
+        audit_info: "{{ audit_rows | selectattr('status', 'equalto', 'INFO') | list }}"
+        audit_date: "{{ lookup('pipe', 'date +%Y-%m-%d_%H%M') }}"
+
+    - name: Katalog na raporty (na Twoim komputerze, ansible/reports)
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+
+    - name: Zapisz raport Markdown
+      ansible.builtin.template:
+        src: ../templates/audit_report.md.j2
+        dest: "{{ report_dir }}/audit_{{ inventory_hostname }}_{{ audit_date }}.md"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+
+    - name: Podsumowanie
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['Wynik: ' ~ audit_ok | length ~ ' OK, ' ~ audit_warn | length ~ ' WARN, ' ~ audit_fail | length ~ ' FAIL'
+              ~ ' - raport: ansible/reports/audit_' ~ inventory_hostname ~ '_' ~ audit_date ~ '.md']
+             + (audit_fail | map(attribute='check') | map('regex_replace', '^', 'FAIL: ') | list)
+             + (audit_warn | map(attribute='check') | map('regex_replace', '^', 'WARN: ') | list) }}
+
+    - name: Zakończ błędem, jeśli są luki (FAIL)
+      ansible.builtin.fail:
+        msg: "Audyt: {{ audit_fail | length }} FAIL - szczegóły i jak naprawić w raporcie."
+      when: audit_fail | length > 0

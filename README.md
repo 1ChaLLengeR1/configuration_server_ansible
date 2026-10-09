@@ -30,7 +30,10 @@ tworzenie użytkowników, hardening SSH.
         ├── add_user.yml            # dodaje kolejnego usera (NEW_USER_*) + weryfikuje logowanie SSH
         ├── firewall.yml            # ufw + fail2ban
         ├── wireguard.yml           # tunel WireGuard wg0 (Swarm między serwerami tylko w tunelu)
-        └── swarm_wireguard.yml     # Docker Swarm na adresie WireGuarda + etykiety węzła
+        ├── swarm_wireguard.yml     # Docker Swarm na adresie WireGuarda + etykiety węzła
+        ├── system_hardening.yml    # aktualizacje bezpieczeństwa, swap, czas, limity SSH, sysctl, konta, locale
+        ├── docker_postgres_tuning.yml # limity logów Dockera/journald + strojenie PostgreSQL
+        └── audit.yml               # audyt serwera (tylko odczyt) -> raport w ansible/reports/
 ```
 
 ## Krok 1 — `.env` w katalogu głównym
@@ -334,3 +337,66 @@ Uwagi:
   playbook zapisuje teraz ustawienia w `00-hardening.conf` i sprawdza wynik przez `sshd -T`.
 - Kolejny węzeł: na nim `create-user` … `install-wireguard` z `WG_ADDRESS_1=10.99.0.2/24`, peery po
   obu stronach przez zmienną `wg_peers` (opis w `wireguard.yml`), potem `docker swarm join` po adresach WG.
+
+## Krok 9 — hardening systemu, limity logów i strojenie PostgreSQL
+
+1. Opcjonalnie w `.env` (w nawiasie wartości domyślne):
+
+   ```env
+   SSH_ALLOW_USERS_1=artur deploy   # konta z dostępem SSH, po spacji (puste = bez AllowUsers);
+                                    # SERVER_USER_1 musi być na liście
+   LOCK_USERS_1=debian              # konta do zablokowania (debian)
+   SWAP_SIZE_1=4G                   # plik swap (4G); istniejący swap zostaje
+   DOCKER_LOG_MAX_SIZE_1=20m        # limit pliku logu kontenera (20m)
+   DOCKER_LOG_MAX_FILE_1=5          # liczba plików logu na kontener (5)
+   JOURNALD_MAX_USE_1=1G            # limit logów systemowych (1G)
+   PG_SHARED_BUFFERS_1=2GB          # strojenie PostgreSQL pod 12 GB RAM z kontenerami obok (2GB,
+   PG_EFFECTIVE_CACHE_SIZE_1=6GB    #   6GB, 512MB, 16MB, 100) - przy innym serwerze dostosuj
+   PG_MAINTENANCE_WORK_MEM_1=512MB
+   PG_WORK_MEM_1=16MB
+   PG_MAX_CONNECTIONS_1=100
+   ```
+
+   i `make down && make up`.
+
+2. Uruchom:
+
+   ```
+   make system-hardening       # bez przerwy w działaniu (restart sshd tylko przy zmianie limitów)
+   make tune-docker-postgres   # przy zmianie: restart Dockera (wszystkie kontenery) i PostgreSQL
+   ```
+
+Uwagi:
+- Automatyczne aktualizacje obejmują źródła Debiana (m.in. bezpieczeństwo), **nie** repo Dockera
+  i **nie** restartują serwera — po aktualizacji jądra restart robisz sam, w dogodnym momencie.
+- Limit logów Dockera działa dla kontenerów tworzonych po zmianie (kolejny deploy stacka).
+- Po `SSH_ALLOW_USERS_1` sprawdź w nowym terminalu, że logowanie dalej działa (jak po `harden-ssh`).
+
+## Krok 10 — audyt serwera (tylko odczyt)
+
+```
+make audit
+```
+
+Uruchamia `ansible/files/audit.sh` na serwerze (nic nie zmienia) i zapisuje raport
+`ansible/reports/audit_<host>_<data>.md` (katalog w `.gitignore`) z sekcjami **❌ Brakuje / luki**,
+**⚠️ Do poprawy**, **✅ Mamy**, **ℹ️ Informacje** i listą tego, czego audyt z serwera sprawdzić nie może
+(kopie zapasowe robione przez aplikację, Cloudflare, 2FA na kontach, klucze na Twoim komputerze, aplikacja,
+alerty). Playbook kończy się błędem, jeśli jest choć jedna luka (FAIL) — przy każdym FAIL w raporcie jest
+podpowiedź, którym `make` to naprawić.
+
+Co sprawdza:
+
+| Obszar | Sprawdzenia |
+|---|---|
+| system | restart po aktualizacji jądra, automatyczne aktualizacje, oczekujące łatki bezpieczeństwa, NTP, swap, dysk, limit journald |
+| sysctl | SYN cookies, przekierowania ICMP, source routing, `kptr_restrict`, `ip_forward` (Docker) |
+| konta | tylko root z UID 0, konta bez hasła, `sudo` bez `NOPASSWD`, grupy `sudo`/`docker`, zablokowane konta (`LOCK_USERS_1`) |
+| ssh | root i hasła wyłączone (wynikowa konfiguracja `sshd -T`), `MaxAuthTries`, `AllowUsers`, X11, klucze w `authorized_keys` |
+| zapora | ufw aktywny z domyślną blokadą, fail2ban z jailem sshd, usługi nasłuchujące publicznie poza `AUDIT_PUBLIC_PORTS_1`, reguły `DOCKER-USER` (porty kontenerów omijają ufw) |
+| wireguard | `wg0` z adresem `WG_ADDRESS_1`, start z systemem, uprawnienia klucza, peery i handshake, Docker po `wg0` |
+| docker | działa, limit logów kontenerów, Swarm na adresie WG, węzły, etykieta (`SWARM_NODE_LABELS_1`), MTU sieci overlay, porty publikowane |
+| postgres | nie słucha publicznie, słucha na `docker_gwbridge`, start po Dockerze, `pg_hba` bez `trust` i bez `0.0.0.0/0`, `scram-sha-256`, superuserzy, strojenie, baza `AUDIT_DB_NAME_1` i rozszerzenia, kopia na hoście |
+
+Skrypt da się też odpalić ręcznie na serwerze: `sudo bash audit.sh` (wynik linia po linii:
+`STATUS|OBSZAR|SPRAWDZENIE|SZCZEGÓŁY`).

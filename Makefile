@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f dockerfiles/docker-compose.yml --env-file .env
 
-.PHONY: build up down shell ping logs create-user verify-user harden-ssh install-docker-swarm install-postgresql add-user install-firewall install-wireguard swarm-wireguard
+.PHONY: build up down shell ping logs create-user verify-user harden-ssh install-docker-swarm install-postgresql add-user install-firewall install-wireguard swarm-wireguard system-hardening tune-docker-postgres audit
 
 ## Zbuduj obraz Docker z Ansible (dockerfiles/ansible.dockerfile)
 build:
@@ -62,6 +62,24 @@ install-wireguard:
 ## WYMAGA wcześniej `make install-wireguard`; po nim odpal ponownie `make install-postgresql`.
 swarm-wireguard:
 	$(COMPOSE) exec ansible ansible-playbook playbooks/swarm_wireguard.yml
+
+## Hardening systemu: automatyczne aktualizacje bezpieczeństwa (bez auto-restartu), swap, czas (UTC + NTP),
+## limity SSH (SSH_ALLOW_USERS_1), sysctl, blokada nieużywanych kont (LOCK_USERS_1), locale
+## (ansible/playbooks/system_hardening.yml).
+system-hardening:
+	$(COMPOSE) exec ansible ansible-playbook playbooks/system_hardening.yml
+
+## Limity logów Dockera i journald + strojenie PostgreSQL pod RAM serwera (PG_*_1 w .env)
+## (ansible/playbooks/docker_postgres_tuning.yml). UWAGA: przy zmianie restartuje Dockera (wszystkie
+## kontenery) i PostgreSQL - na produkcji z ruchem uruchamiaj w oknie serwisowym.
+tune-docker-postgres:
+	$(COMPOSE) exec ansible ansible-playbook playbooks/docker_postgres_tuning.yml
+
+## Audyt serwera - TYLKO ODCZYT (ansible/playbooks/audit.yml + ansible/files/audit.sh): SSH, konta, zapora,
+## WireGuard, Swarm, PostgreSQL, system. Raport Markdown: ansible/reports/audit_<host>_<data>.md.
+## Kończy się błędem, jeśli jest choć jedna luka (FAIL); WARN tylko raportuje.
+    audit:
+	$(COMPOSE) exec ansible ansible-playbook playbooks/audit.yml
 
 ## Dodaj nowego użytkownika (NEW_USER_* w .env) + zaimportuj klucz + zweryfikuj logowanie SSH (ansible/playbooks/add_user.yml)
 ## Przed uruchomieniem uzupełnij NEW_USER_* w .env i zrób `make up`, żeby domontować katalog z kluczem.

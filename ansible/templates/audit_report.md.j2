@@ -1,0 +1,58 @@
+# Audyt serwera {{ inventory_hostname }} ({{ ansible_host }})
+
+Data: {{ audit_date | replace('_', ' ') }} · wynik: **{{ audit_ok | length }} OK**, **{{ audit_warn | length }} WARN**, **{{ audit_fail | length }} FAIL**
+· wygenerowane przez `make audit` (configuration_server_ansible, tylko odczyt).
+
+Legenda: ✅ jest tak, jak powinno · ⚠️ działa, ale do poprawy albo świadomej decyzji · ❌ brakuje albo jest źle (luka).
+
+## ❌ Brakuje / luki ({{ audit_fail | length }})
+{% if audit_fail %}
+
+| Obszar | Sprawdzenie | Szczegóły / jak naprawić |
+|---|---|---|
+{% for r in audit_fail %}
+| {{ r.category }} | {{ r.check }} | {{ r.details | replace('|', '/') }} |
+{% endfor %}
+{% else %}
+
+Brak.
+{% endif %}
+
+## ⚠️ Do poprawy ({{ audit_warn | length }})
+{% if audit_warn %}
+
+| Obszar | Sprawdzenie | Szczegóły |
+|---|---|---|
+{% for r in audit_warn %}
+| {{ r.category }} | {{ r.check }} | {{ r.details | replace('|', '/') }} |
+{% endfor %}
+{% else %}
+
+Brak.
+{% endif %}
+
+## ✅ Mamy ({{ audit_ok | length }})
+
+| Obszar | Sprawdzenie | Szczegóły |
+|---|---|---|
+{% for r in audit_ok %}
+| {{ r.category }} | {{ r.check }} | {{ r.details | replace('|', '/') }} |
+{% endfor %}
+
+## ℹ️ Informacje
+
+| Obszar | Co | Wartość |
+|---|---|---|
+{% for r in audit_info %}
+| {{ r.category }} | {{ r.check }} | {{ r.details | replace('|', '/') }} |
+{% endfor %}
+
+## Poza zakresem audytu (sprawdź osobno)
+
+Audyt widzi tylko sam serwer. Nie sprawdza:
+- **kopii zapasowych robionych przez aplikację** (np. `pg_dump` z Celery do GCS) - czy powstają i czy da się z nich odtworzyć bazę (test odtworzenia co miesiąc);
+- **Cloudflare** - czy origin przyjmuje ruch tylko od Cloudflare (mTLS, `DOCKER-USER`), ustawienia SSL/WAF;
+- **kont w usługach zewnętrznych** - 2FA na GitHub, OVH, Cloudflare, Doppler, Docker Hub, Clerk, Stripe (przejęcie konta = przejęcie serwera/deployu);
+- **kluczy SSH na Twoim komputerze** - czy mają hasło (`ssh-keygen -y -f <klucz>` pyta o hasło = ma);
+- **aplikacji** - uprawnienia endpointów, podatne zależności (`pip-audit`), sekrety w repo;
+- **alertów** - czy ktoś dostanie powiadomienie o pełnym dysku, restartach kontenerów, fali błędów 5xx.

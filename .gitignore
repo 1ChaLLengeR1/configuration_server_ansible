@@ -1,3 +1,5 @@
 .env
 *.retry
 .idea/
+# raporty z `make audit` (stan konkretnego serwera)
+ansible/reports/
