@@ -55,11 +55,22 @@
         audit_info: "{{ audit_rows | selectattr('status', 'equalto', 'INFO') | list }}"
         audit_date: "{{ lookup('pipe', 'date +%Y-%m-%d_%H%M') }}"
 
+    # Kontener działa jako root, a /ansible to bind-mount katalogu repo z Twojego komputera — bez `owner`
+    # raporty lądowały jako root:root i nie dało się ich usunąć z IDE. Właściciel = właściciel /ansible.
+    - name: Właściciel katalogu repo (bind-mount /ansible)
+      ansible.builtin.stat:
+        path: /ansible
+      register: ansible_dir_stat
+      delegate_to: localhost
+      become: false
+
     - name: Katalog na raporty (na Twoim komputerze, ansible/reports)
       ansible.builtin.file:
         path: "{{ report_dir }}"
         state: directory
         mode: "0755"
+        owner: "{{ ansible_dir_stat.stat.uid }}"
+        group: "{{ ansible_dir_stat.stat.gid }}"
       delegate_to: localhost
       become: false
 
@@ -68,6 +79,8 @@
         src: ../templates/audit_report.md.j2
         dest: "{{ report_dir }}/audit_{{ inventory_hostname }}_{{ audit_date }}.md"
         mode: "0644"
+        owner: "{{ ansible_dir_stat.stat.uid }}"
+        group: "{{ ansible_dir_stat.stat.gid }}"
       delegate_to: localhost
       become: false
 

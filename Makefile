@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f dockerfiles/docker-compose.yml --env-file .env
 
-.PHONY: build up down shell ping logs create-user verify-user harden-ssh install-docker-swarm install-postgresql add-user install-firewall install-wireguard swarm-wireguard system-hardening tune-docker-postgres audit
+.PHONY: build up down shell ping ping-begin logs create-user create-user-begin verify-user harden-ssh install-docker-swarm install-postgresql add-user install-firewall install-wireguard swarm-wireguard system-hardening tune-docker-postgres audit
 
 ## Zbuduj obraz Docker z Ansible (dockerfiles/ansible.dockerfile)
 build:
@@ -25,6 +25,17 @@ ping:
 ## Utwórz docelowego użytkownika (SERVER_USER_1) + klucz SSH + sudo (ansible/playbooks/create_user.yml)
 create-user:
 	$(COMPOSE) exec ansible ansible-playbook playbooks/create_user.yml
+
+## Świeży serwer (przed create-user): hosts.yml łączy się jako SERVER_USER_1 kluczem, a tego usera jeszcze
+## nie ma — te dwa cele nadpisują połączenie na BEGIN_USER_1 + BEGIN_PASSWORD_1 z .env (np. root z panelu
+## VPS). become wyłączone: przy BEGIN_USER_1=root sudo nie jest potrzebne.
+BEGIN_CONN := -e "ansible_user=$$BEGIN_USER_1" -e "ansible_password=$$BEGIN_PASSWORD_1" -e ansible_become=false
+
+ping-begin:
+	$(COMPOSE) exec ansible sh -c 'ansible-playbook playbooks/ping.yml $(BEGIN_CONN)'
+
+create-user-begin:
+	$(COMPOSE) exec ansible sh -c 'ansible-playbook playbooks/create_user.yml $(BEGIN_CONN)'
 
 ## Sprawdź, czy logowanie jako docelowy użytkownik (SERVER_USER_1) kluczem SSH działa (uruchom przed harden-ssh!)
 verify-user:
