@@ -40,7 +40,7 @@ create-user-begin:
 ## Sprawdź, czy logowanie jako docelowy użytkownik (SERVER_USER_1) kluczem SSH działa (uruchom przed harden-ssh!)
 verify-user:
 	$(COMPOSE) exec ansible sh -c '\
-		ssh -i /keys/$$SERVER_USER_1/id_ed25519 -o StrictHostKeyChecking=no -o BatchMode=yes $$SERVER_USER_1@$$SERVER_HOST_1 \
+		ssh -i /keys/$$SERVER_USER_1/id_ed25519 -p $${SERVER_PORT_1:-$${ANSIBLE_REMOTE_PORT:-22}} -o StrictHostKeyChecking=no -o BatchMode=yes $$SERVER_USER_1@$$SERVER_HOST_1 \
 		"whoami && (sudo -n true 2>/dev/null && echo sudo:NOPASSWD || echo sudo:wymaga_hasla)"'
 
 ## Wyłącz logowanie root i hasłem przez SSH (ansible/playbooks/harden_ssh.yml)
@@ -89,7 +89,7 @@ tune-docker-postgres:
 ## Audyt serwera - TYLKO ODCZYT (ansible/playbooks/audit.yml + ansible/files/audit.sh): SSH, konta, zapora,
 ## WireGuard, Swarm, PostgreSQL, system. Raport Markdown: ansible/reports/audit_<host>_<data>.md.
 ## Kończy się błędem, jeśli jest choć jedna luka (FAIL); WARN tylko raportuje.
-    audit:
+audit:
 	$(COMPOSE) exec ansible ansible-playbook playbooks/audit.yml
 
 ## Dodaj nowego użytkownika (NEW_USER_* w .env) + zaimportuj klucz + zweryfikuj logowanie SSH (ansible/playbooks/add_user.yml)

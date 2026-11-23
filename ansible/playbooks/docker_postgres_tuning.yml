@@ -73,60 +73,70 @@
         recurse: true
       register: pg_conf_find
 
-    - name: Przerwij, jeśli nie znaleziono postgresql.conf
-      ansible.builtin.fail:
-        msg: "Nie znaleziono postgresql.conf pod /etc/postgresql - najpierw `make install-postgresql`."
-      when: pg_conf_find.matched == 0
-
-    - name: Ustal katalog konfiguracyjny klastra
+    # Bez natywnego PostgreSQL (np. baza w kontenerze stacka aplikacji, strojona w jej compose) część
+    # PostgreSQL jest pomijana - limity logów Dockera i journald idą zawsze.
+    - name: Czy jest natywny PostgreSQL
       ansible.builtin.set_fact:
-        pg_conf_dir: "{{ pg_conf_find.files[0].path | dirname }}"
+        pg_native: "{{ pg_conf_find.matched > 0 }}"
 
-    # Debian dołącza conf.d na końcu postgresql.conf (include_dir) - nasz plik nadpisuje wartości
-    # domyślne bez edycji głównego pliku.
-    - name: Upewnij się, że postgresql.conf wczytuje conf.d
-      ansible.builtin.lineinfile:
-        path: "{{ pg_conf_dir }}/postgresql.conf"
-        regexp: "^#?\\s*include_dir\\s*="
-        line: "include_dir = 'conf.d'"
-      notify: Zrestartuj PostgreSQL
+    - name: Brak natywnego PostgreSQL - pomijam strojenie bazy
+      ansible.builtin.debug:
+        msg: "Nie znaleziono postgresql.conf pod /etc/postgresql - strojenie PostgreSQL pominięte."
+      when: not pg_native
 
-    - name: Katalog conf.d klastra
-      ansible.builtin.file:
-        path: "{{ pg_conf_dir }}/conf.d"
-        state: directory
-        owner: postgres
-        group: postgres
-        mode: "0755"
+    - name: Strojenie natywnego PostgreSQL
+      when: pg_native
+      block:
+        - name: Ustal katalog konfiguracyjny klastra
+          ansible.builtin.set_fact:
+            pg_conf_dir: "{{ pg_conf_find.files[0].path | dirname }}"
 
-    - name: Strojenie PostgreSQL (pamięć, dysk SSD, WAL)
-      ansible.builtin.copy:
-        dest: "{{ pg_conf_dir }}/conf.d/90-tuning.conf"
-        owner: postgres
-        group: postgres
-        mode: "0644"
-        content: |
-          # Zarządzane przez Ansible (configuration_server_ansible, docker_postgres_tuning.yml)
-          max_connections = {{ pg_max_connections }}
-          shared_buffers = {{ pg_shared_buffers }}
-          effective_cache_size = {{ pg_effective_cache_size }}
-          maintenance_work_mem = {{ pg_maintenance_work_mem }}
-          work_mem = {{ pg_work_mem }}
-          # dysk SSD/NVMe (VPS) - losowy odczyt prawie tak tani jak sekwencyjny
-          random_page_cost = 1.1
-          effective_io_concurrency = 200
-          # rzadsze, rozłożone w czasie checkpointy
-          checkpoint_completion_target = 0.9
-          max_wal_size = 2GB
-          min_wal_size = 512MB
-          wal_compression = on
-      notify: Zrestartuj PostgreSQL
+        # Debian dołącza conf.d na końcu postgresql.conf (include_dir) - nasz plik nadpisuje wartości
+        # domyślne bez edycji głównego pliku.
+        - name: Upewnij się, że postgresql.conf wczytuje conf.d
+          ansible.builtin.lineinfile:
+            path: "{{ pg_conf_dir }}/postgresql.conf"
+            regexp: "^#?\\s*include_dir\\s*="
+            line: "include_dir = 'conf.d'"
+          notify: Zrestartuj PostgreSQL
+
+        - name: Katalog conf.d klastra
+          ansible.builtin.file:
+            path: "{{ pg_conf_dir }}/conf.d"
+            state: directory
+            owner: postgres
+            group: postgres
+            mode: "0755"
+
+        - name: Strojenie PostgreSQL (pamięć, dysk SSD, WAL)
+          ansible.builtin.copy:
+            dest: "{{ pg_conf_dir }}/conf.d/90-tuning.conf"
+            owner: postgres
+            group: postgres
+            mode: "0644"
+            content: |
+              # Zarządzane przez Ansible (configuration_server_ansible, docker_postgres_tuning.yml)
+              max_connections = {{ pg_max_connections }}
+              shared_buffers = {{ pg_shared_buffers }}
+              effective_cache_size = {{ pg_effective_cache_size }}
+              maintenance_work_mem = {{ pg_maintenance_work_mem }}
+              work_mem = {{ pg_work_mem }}
+              # dysk SSD/NVMe (VPS) - losowy odczyt prawie tak tani jak sekwencyjny
+              random_page_cost = 1.1
+              effective_io_concurrency = 200
+              # rzadsze, rozłożone w czasie checkpointy
+              checkpoint_completion_target = 0.9
+              max_wal_size = 2GB
+              min_wal_size = 512MB
+              wal_compression = on
+          notify: Zrestartuj PostgreSQL
 
     - name: Zastosuj zmiany (restarty tylko przy zmianie konfiguracji)
       ansible.builtin.meta: flush_handlers
 
     # --- weryfikacja ---
     - name: Odczytaj ustawienia PostgreSQL po zmianach
+      when: pg_native
       become_user: postgres
       ansible.builtin.command: >-
         psql -XAtc "select name || '=' || current_setting(name) from pg_settings
@@ -146,7 +156,7 @@
       ansible.builtin.debug:
         msg:
           - "Docker: driver logów {{ docker_logging.stdout }}, limit {{ docker_log_max_size }} x {{ docker_log_max_file }} (nowe kontenery)"
-          - "PostgreSQL: {{ pg_settings.stdout_lines | join(', ') }}"
+          - "PostgreSQL: {{ pg_settings.stdout_lines | join(', ') if pg_native else 'brak natywnego - pominięty' }}"
 
   handlers:
     # PostgreSQL słucha na gateway docker_gwbridge - po restarcie Dockera restartujemy też bazę, żeby
@@ -166,3 +176,4 @@
       ansible.builtin.service:
         name: postgresql
         state: restarted
+      when: pg_native | default(false)

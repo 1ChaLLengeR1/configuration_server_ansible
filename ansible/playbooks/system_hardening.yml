@@ -18,6 +18,10 @@
   become: true
   vars:
     swap_size: "{{ lookup('env', 'SWAP_SIZE_1') | default('4G', true) }}"
+    # Kontener LXC (np. Mikrus): swap, kernel.*/vm.* i zegar należą do hosta - z kontenera nie da się ich
+    # zmienić (swapon / sysctl: Operation not permitted). Na pełnej VM bez zmian. SWAP_SIZE_1=0 też wyłącza swap.
+    is_container: "{{ ansible_facts['virtualization_type'] | default('') in ['lxc', 'openvz', 'container', 'docker'] and ansible_facts['virtualization_role'] | default('') == 'guest' }}"
+    swap_enabled: "{{ not is_container and swap_size not in ['0', 'none', 'off'] }}"
     swap_file: /swapfile
     ssh_allow_users: "{{ lookup('env', 'SSH_ALLOW_USERS_1') | split(' ') | map('trim') | select | list }}"
     lock_users: "{{ lookup('env', 'LOCK_USERS_1') | default('debian', true) | split(',') | map('trim') | select | list }}"
@@ -77,14 +81,14 @@
       args:
         executable: /bin/bash
         creates: "{{ swap_file }}"
-      when: swap_size and swap_active.stdout | trim == ''
+      when: swap_enabled and swap_active.stdout | trim == ''
 
     - name: Swap montowany po restarcie (fstab)
       ansible.builtin.lineinfile:
         path: /etc/fstab
         regexp: '^{{ swap_file }}\s'
         line: "{{ swap_file }} none swap sw 0 0"
-      when: swap_size and swap_active.stdout | trim == ''
+      when: swap_enabled and swap_active.stdout | trim == ''
 
     # --- sysctl: swap + sieć ---
     - name: Ustawienia jądra (swappiness, ochrona sieci)
@@ -94,7 +98,9 @@
         content: |
           # Zarządzane przez Ansible (configuration_server_ansible, system_hardening.yml)
           # Swap tylko w ostateczności (RAM dla PostgreSQL i kontenerów).
+          {% if not is_container %}
           vm.swappiness = 10
+          {% endif %}
           # Ochrona przed zalewem SYN.
           net.ipv4.tcp_syncookies = 1
           # Bez przekierowań ICMP i source routingu (serwer nie jest routerem dla obcych).
@@ -108,14 +114,17 @@
           net.ipv6.conf.all.accept_source_route = 0
           net.ipv4.icmp_echo_ignore_broadcasts = 1
           # Wycieki adresów jądra dla zwykłych użytkowników.
+          {% if not is_container %}
           kernel.kptr_restrict = 2
           kernel.dmesg_restrict = 1
+          {% endif %}
           # Celowo bez zmian: net.ipv4.ip_forward (wymagany przez Dockera) i rp_filter (tryb strict
           # psuje ruch overlay/WireGuard).
       register: sysctl_conf
 
     - name: Zastosuj ustawienia jądra
-      ansible.builtin.command: sysctl --system
+      # tylko nasz plik - `sysctl --system` w kontenerze pada na kluczach jądra z innych plików
+      ansible.builtin.command: sysctl -p /etc/sysctl.d/90-hardening.conf
       when: sysctl_conf.changed
 
     # --- czas ---
@@ -126,13 +135,16 @@
       ansible.builtin.apt:
         name: systemd-timesyncd
         state: present
-      when: "'chrony.service' not in ansible_facts.services"
+      when:
+        - not is_container  # w kontenerze zegar synchronizuje host
+        - "'chrony.service' not in ansible_facts.services"
 
     - name: Upewnij się, że synchronizacja czasu działa
       ansible.builtin.service:
         name: "{{ 'chrony' if 'chrony.service' in ansible_facts.services else 'systemd-timesyncd' }}"
         state: started
         enabled: true
+      when: not is_container  # w kontenerze zegar synchronizuje host
 
     - name: Strefa czasowa UTC (logi i cron spójne między serwerami)
       ansible.builtin.command: timedatectl set-timezone UTC

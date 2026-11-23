@@ -78,7 +78,7 @@
     - name: Weryfikacja — nowe, niezależne połączenie SSH kluczem prywatnym nowego użytkownika
       ansible.builtin.command:
         cmd: >-
-          ssh -i {{ new_user_key_path }}
+          ssh -i {{ new_user_key_path }} -p {{ ansible_port | default(22) }}
           -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10
           {{ new_user_name }}@{{ ansible_host }}
           whoami
@@ -99,7 +99,7 @@
     - name: Weryfikacja sudo nowym połączeniem (informacyjnie)
       ansible.builtin.command:
         cmd: >-
-          ssh -i {{ new_user_key_path }}
+          ssh -i {{ new_user_key_path }} -p {{ ansible_port | default(22) }}
           -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10
           {{ new_user_name }}@{{ ansible_host }}
           "sudo -n true 2>/dev/null && echo sudo:NOPASSWD || echo sudo:wymaga_hasla"
