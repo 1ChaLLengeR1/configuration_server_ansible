@@ -207,7 +207,10 @@
         path: /etc/systemd/resolved.conf.d
         state: directory
         mode: "0755"
-      when: "'systemd-resolved.service' in ansible_facts.services"
+      when:
+        - "'systemd-resolved.service' in ansible_facts.services"
+        # zamaskowany (np. Mikrus/LXC - DNS ze statycznego resolv.conf hosta) = nie działa, nie ruszamy
+        - "ansible_facts.services['systemd-resolved.service'].status != 'masked'"
 
     - name: Wyłącz LLMNR i mDNS w systemd-resolved
       ansible.builtin.copy:
@@ -219,13 +222,16 @@
           LLMNR=no
           MulticastDNS=no
       register: resolved_conf
-      when: "'systemd-resolved.service' in ansible_facts.services"
+      when:
+        - "'systemd-resolved.service' in ansible_facts.services"
+        # zamaskowany (np. Mikrus/LXC - DNS ze statycznego resolv.conf hosta) = nie działa, nie ruszamy
+        - "ansible_facts.services['systemd-resolved.service'].status != 'masked'"
 
     - name: Zrestartuj systemd-resolved po zmianie
       ansible.builtin.service:
         name: systemd-resolved
         state: restarted
-      when: resolved_conf is changed
+      when: resolved_conf is changed  # pominięte zadanie wyżej (masked) = brak zmiany = brak restartu
 
     # cloud-init daje domyślnemu kontu obrazu (np. `debian`) sudo BEZ hasła (/etc/sudoers.d/90-cloud-init-users).
     # Zablokowane konto i tak się nie zaloguje, ale odblokowanie go = natychmiastowy root - usuwamy regułę.

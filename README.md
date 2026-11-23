@@ -4,6 +4,48 @@ Ansible uruchamiany z kontenera Docker (nie trzeba mieć Ansible zainstalowanego
 lokalnie) do zarządzania konfiguracją serwera — sprawdzanie połączenia,
 tworzenie użytkowników, hardening SSH.
 
+## Dwa warianty serwera — przeczytaj najpierw
+
+Playbooki obsługują dwa typy serwerów. Część różnic wykrywają same (system, wirtualizacja), część
+wymaga innej kolejności kroków albo zmiennych w `.env`.
+
+| | **A — pełna VM z własnym IPv4** | **B — kontener LXC ze współdzielonym IPv4 (Mikrus)** |
+|---|---|---|
+| Przykłady | OVH, Hostinger VPS, Hetzner, GCP — wirtualizacja KVM | Mikrus 3.x (`systemd-detect-virt` → `lxc`, jądro `*-pve`) |
+| Adres / SSH | własne IPv4, SSH na 22 | wspólne IPv4 hosta z kilkoma przekierowanymi portami, SSH po IPv4 np. `srv72.mikr.us:10384` (`SERVER_PORT_1`); własne tylko IPv6 |
+| Ruch WWW 80/443 | rekord A na IP serwera, Let's Encrypt bezpośrednio | **brak 80/443 na IPv4** — rekordy AAAA + proxy Cloudflare (pomarańczowa chmurka), certyfikat origin Cloudflare w Traefiku |
+| PostgreSQL | **natywnie na hoście** (`make install-postgresql`, `make tune-docker-postgres` stroi bazę) | **kontener w stacku aplikacji** (compose aplikacji, strojenie parametrami `-c`); `install-postgresql` pomijasz, `tune-docker-postgres` sam pomija część bazy |
+| Swap | plik swap (`SWAP_SIZE_1`, domyślnie 4G) | brak — swap należy do hosta (pomijany automatycznie) |
+| Zegar, `kernel.*`, `vm.*` | NTP + sysctl z playbooka | należą do hosta — pomijane automatycznie |
+| Usługi zamaskowane przez dostawcę | — | `unattended-upgrades`, `apt-daily*` (odmaskować ręcznie, sekcja „Mikrus”), `systemd-resolved` (zostawić!) |
+
+**Kolejność — wariant A** (natywny PostgreSQL):
+```
+make ping-begin → make create-user-begin → make verify-user → make harden-ssh
+make install-docker-swarm          # Docker + swarm init (na publicznym IP albo SWARM_ADVERTISE_ADDR_1)
+make install-firewall → make install-wireguard → make swarm-wireguard   # Swarm na adresie WG
+make install-postgresql            # natywny PostgreSQL, listen na docker_gwbridge, rola deploy
+make system-hardening → make tune-docker-postgres
+make add-user                      # np. deploy dla CD
+make audit
+```
+
+**Kolejność — wariant B** (Mikrus, PostgreSQL w kontenerze aplikacji):
+```
+make ping-begin → make create-user-begin → make verify-user → make harden-ssh
+make install-docker-swarm          # instaluje Dockera; `swarm init` padnie na nazwie hosta - to OK,
+                                   # Swarm zainicjuje swarm-wireguard (od razu na adresie WG)
+make install-firewall → make install-wireguard → make swarm-wireguard
+# (raz, ręcznie) odmaskuj aktualizacje - sekcja „Mikrus” niżej
+make system-hardening → make tune-docker-postgres   # bez install-postgresql
+make add-user
+make audit                         # sekcja postgres pokaże braki (sprawdza natywną bazę) - spodziewane
+```
+
+Kupując kolejny serwer: **z własnym IPv4 i pełną VM — wariant A** (prościej: bez Cloudflare jako
+obowiązkowego mostu IPv4, natywna baza z kopią na hoście, swap). Wariant B tylko przy taniej usłudze
+w kontenerze bez własnego IPv4.
+
 ## Wymagania
 
 - Docker + wtyczka `docker compose`
@@ -45,6 +87,14 @@ usera systemowego i hasło, np. `debian` na obrazach cloud-init):
 SERVER_HOST_1=1.2.3.4
 BEGIN_USER_1=debian
 BEGIN_PASSWORD_1=haslo-startowe
+```
+
+SSH na innym porcie niż 22 (np. Mikrus po IPv4: `srv72.mikr.us` + port `10384`):
+
+```env
+SERVER_HOST_1=srv72.mikr.us
+SERVER_PORT_1=10384
+BEGIN_USER_1=root
 ```
 
 Wartości **bez cudzysłowów** — `docker --env-file` przekazuje je dosłownie,
@@ -161,6 +211,11 @@ dokumentację startowego dostępu albo usunąć.
 
 ## Krok 7 — Docker + Swarm, potem PostgreSQL
 
+> **Wariant B (Mikrus, baza w kontenerze aplikacji):** z tego kroku tylko `make install-docker-swarm`
+> (Docker), PostgreSQL pomijasz. Repozytorium Dockera dobiera się samo (`linux/ubuntu` albo
+> `linux/debian` z faktów Ansible). `swarm init` na nazwie hosta (`SERVER_HOST_1=srv72.mikr.us`) padnie
+> — Swarm zainicjuje `make swarm-wireguard` (Krok 8) od razu na adresie WG.
+
 Te dwa playbooki działają niezależnie od Kroków 4–6 (można je odpalić od razu
 po `make ping`, jako `debian`, albo później jako `SERVER_USER_1` — nie ma to
 znaczenia). **Kolejność jest jednak istotna i odwrotna niż numeracja plików
@@ -266,12 +321,14 @@ danych. Mogą mieć tę samą nazwę i różne hasła, nie mają ze sobą nic ws
 | Zmienna | Do czego służy |
 |---|---|
 | `SERVER_HOST_1` | adres IP/hostname serwera (używany zawsze — i na starcie, i po hardeningu) |
+| `SERVER_PORT_1` | port SSH serwera (domyślnie 22; Mikrus po IPv4: `10000 + numer VPS-a`, np. `10384`) |
+| `SWARM_ADVERTISE_ADDR_1` | adres dla `swarm init` w `install-docker-swarm` (IP albo interfejs; domyślnie `SERVER_HOST_1`) — wariant B nie potrzebuje, Swarm stawia `swarm-wireguard` |
 | `BEGIN_USER_1` | startowy użytkownik (hasłowy, tylko do pierwszego logowania) — martwy po `harden-ssh` |
 | `BEGIN_PASSWORD_1` | startowe hasło — martwe po `harden-ssh` |
 | `SERVER_USER_1` | nazwa docelowego użytkownika (tworzony przez `create-user`, używany po hardeningu) |
 | `SERVER_SSH_KEY_PATH_1` | katalog z kluczem SSH docelowego użytkownika (host, montowany do kontenera) |
 | `SERVER_PASSWORD_1` | hasło systemowe docelowego użytkownika (do logowania lokalnego / `sudo`) |
-| `PG_DEPLOY_PASSWORD_1` | hasło CI dla roli `deploy` w PostgreSQL (`playbooks/postgresql.yml`) |
+| `PG_DEPLOY_PASSWORD_1` | hasło CI dla roli `deploy` w PostgreSQL (`playbooks/postgresql.yml`) — tylko wariant A |
 | `NEW_USER_NAME` | nazwa kolejnego usera do dodania (`playbooks/add_user.yml`) |
 | `NEW_USER_SSH_KEY_PATH` | katalog z kluczem SSH tego usera (host, montowany do kontenera) |
 | `NEW_USER_PASSWORD` | hasło systemowe tego usera (do `sudo`, nie do logowania SSH) |
@@ -371,6 +428,43 @@ Uwagi:
   i **nie** restartują serwera — po aktualizacji jądra restart robisz sam, w dogodnym momencie.
 - Limit logów Dockera działa dla kontenerów tworzonych po zmianie (kolejny deploy stacka).
 - Po `SSH_ALLOW_USERS_1` sprawdź w nowym terminalu, że logowanie dalej działa (jak po `harden-ssh`).
+  Dopisz tam też usera CD (np. `deploy`), inaczej deploy z GitHuba straci dostęp.
+- **Kontener LXC (wariant B)** — `system-hardening` sam to wykrywa (`virtualization_type: lxc`) i pomija
+  swap, `vm.swappiness`, `kernel.*` i synchronizację czasu (należą do hosta). `SWAP_SIZE_1=0` wyłącza
+  swap także na VM. Ustawienia jądra stosuje tylko z własnego pliku (`sysctl -p`), bo `sysctl --system`
+  w kontenerze pada na kluczach z innych plików. Zadania `systemd-resolved` są pomijane, gdy usługa
+  jest zamaskowana.
+- **`tune-docker-postgres` bez natywnego PostgreSQL** (wariant B) — limity logów Dockera i journald idą
+  zawsze, strojenie bazy (i jej restart) jest pomijane z komunikatem. Bazę w kontenerze stroi compose
+  aplikacji. `PG_*_1` mają znaczenie tylko w wariancie A.
+
+## Mikrus (LXC) — uwagi
+
+Sprawdzone na Mikrusie 3.5 (Ubuntu 24.04, 1 vCPU, 4 GB RAM bez swapu, 40 GB): WireGuard i VXLAN działają,
+Swarm wstaje na adresie WG.
+
+- **SSH:** z zewnątrz po IPv4 przez `srv<NN>.mikr.us:<10000 + numer>` (`SERVER_HOST_1` + `SERVER_PORT_1`),
+  w środku port 22. Startowo `BEGIN_USER_1=root` + hasło z maila Mikrusa (`make ping-begin`,
+  `make create-user-begin`). Runnery GitHub Actions nie mają IPv6 — CD łączy się tym samym portem IPv4.
+- **Usługi zamaskowane przez Mikrusa:** `unattended-upgrades`, `apt-daily.timer`, `apt-daily-upgrade.timer`
+  oraz `apt-daily.service`, `apt-daily-upgrade.service`. `system-hardening` przerwie się na „Unit … is
+  masked”. Raz, ręcznie na serwerze (aktualizacje tylko z repozytoriów bezpieczeństwa, bez auto-restartu):
+
+  ```bash
+  sudo systemctl unmask unattended-upgrades apt-daily.service apt-daily-upgrade.service \
+    apt-daily.timer apt-daily-upgrade.timer
+  sudo systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
+  systemctl list-timers 'apt-daily*' --no-pager      # oba timery z datą NEXT
+  ```
+
+  Pierwsze uruchomienie timerów od razu robi aktualizację — przed `make system-hardening` poczekaj, aż
+  `systemctl is-active apt-daily.service apt-daily-upgrade.service` pokaże `inactive` (blokada dpkg).
+- **`systemd-resolved` NIE odmaskowywać** — DNS w kontenerze idzie przez statyczny `/etc/resolv.conf`
+  od hosta; włączony resolved mógłby go przejąć i serwer straciłby rozwiązywanie nazw.
+- **WWW:** wspólne IPv4 nie ma 80/443 — domeny przez Cloudflare (rekordy AAAA na IPv6 VPS-a z proxy),
+  certyfikat origin Cloudflare w Traefiku. Porty publikowane przez Dockera po IPv6 sprawdź po instalacji
+  (`ss -tlnp`).
+- **Audyt:** brak swapu i NTP oraz sekcja PostgreSQL (baza w kontenerze) dadzą WARN/FAIL — spodziewane.
 
 ## Krok 10 — audyt serwera (tylko odczyt)
 
