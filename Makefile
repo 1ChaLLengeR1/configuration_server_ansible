@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f dockerfiles/docker-compose.yml --env-file .env
 
-.PHONY: build up down shell ping ping-begin logs create-user create-user-begin verify-user harden-ssh install-docker-swarm install-postgresql add-user install-firewall install-wireguard swarm-wireguard system-hardening tune-docker-postgres audit
+.PHONY: build up down shell ping ping-begin logs create-user create-user-begin verify-user harden-ssh install-docker-swarm install-doppler install-postgresql add-user install-firewall install-wireguard swarm-wireguard system-hardening tune-docker-postgres audit
 
 ## Zbuduj obraz Docker z Ansible (dockerfiles/ansible.dockerfile)
 build:
@@ -52,6 +52,11 @@ harden-ssh:
 ## URUCHAMIAJ PRZED `make install-postgresql` (patrz komentarz w pliku playbooka).
 install-docker-swarm:
 	$(COMPOSE) exec ansible ansible-playbook playbooks/docker_swarm.yml
+
+## Zainstaluj Doppler CLI z oficjalnego repo apt (ansible/playbooks/doppler.yml) — sekrety aplikacji z Dopplera
+## prosto do docker secret w CD, bez plików .env na serwerze. Token NIE jest zapisywany na serwerze.
+install-doppler:
+	$(COMPOSE) exec ansible ansible-playbook playbooks/doppler.yml
 
 ## Zainstaluj PostgreSQL natywnie + skonfiguruj dostęp dla Dockera/Swarm + user deploy (ansible/playbooks/postgresql.yml)
 ## WYMAGA wcześniejszego `make install-docker-swarm`.

@@ -23,6 +23,7 @@ wymaga innej kolejności kroków albo zmiennych w `.env`.
 ```
 make ping-begin → make create-user-begin → make verify-user → make harden-ssh
 make install-docker-swarm          # Docker + swarm init (na publicznym IP albo SWARM_ADVERTISE_ADDR_1)
+make install-doppler               # Doppler CLI — sekrety aplikacji w CD (gdy aplikacja trzyma je w Dopplerze)
 make install-firewall → make install-wireguard → make swarm-wireguard   # Swarm na adresie WG
 make install-postgresql            # natywny PostgreSQL, listen na docker_gwbridge, rola deploy
 make system-hardening → make tune-docker-postgres
@@ -41,6 +42,10 @@ make system-hardening → make tune-docker-postgres   # bez install-postgresql
 make add-user
 make audit                         # sekcja postgres pokaże braki (sprawdza natywną bazę) - spodziewane
 ```
+
+**Pełna VM, ale baza w kontenerze aplikacji** (np. Ściborówka na OVH — Postgres w stacku Swarma): kolejność
+wariantu A **bez** `make install-postgresql`; `tune-docker-postgres` sam pominie strojenie bazy, a `make audit`
+pokaże braki w sekcji postgres (sprawdza natywną bazę) — spodziewane.
 
 Kupując kolejny serwer: **z własnym IPv4 i pełną VM — wariant A** (prościej: bez Cloudflare jako
 obowiązkowego mostu IPv4, natywna baza z kopią na hoście, swap). Wariant B tylko przy taniej usłudze
@@ -68,6 +73,7 @@ w kontenerze bez własnego IPv4.
         ├── create_user.yml         # tworzy usera (SERVER_USER_1) + wgrywa klucz SSH + sudo
         ├── harden_ssh.yml          # wyłącza root/hasła w SSH
         ├── docker_swarm.yml        # instaluje Docker CE + docker swarm init
+        ├── doppler.yml             # instaluje Doppler CLI (oficjalne repo apt), bez tokenu na serwerze
         ├── postgresql.yml          # instaluje PostgreSQL + rolę deploy (CREATEDB) dla Swarm
         ├── add_user.yml            # dodaje kolejnego usera (NEW_USER_*) + weryfikuje logowanie SSH
         ├── firewall.yml            # ufw + fail2ban
@@ -273,6 +279,20 @@ w obrębie tej samej bazy. Rola `deploy` jest też tworzona z `encrypted: true`
 w module `community.postgresql.postgresql_user`, więc jej hasło w bazie jest
 przechowywane jako hash `scram-sha-256`, nie w postaci jawnej ani jako `md5`.
 
+## Krok 7a — Doppler CLI (sekrety aplikacji bez plików na serwerze)
+
+```
+make install-doppler
+```
+
+Instaluje samo CLI z oficjalnego repozytorium apt Dopplera (klucz GPG jak przy Dockerze). Na serwerze nie ma
+logowania ani zapisanego tokenu: CD aplikacji podaje service token przy każdym wywołaniu
+(`doppler secrets download --token … --no-file | docker secret create …`), więc sekrety trafiają z Dopplera
+prosto do Docker secret i procesu kontenera — żaden `.env` nie leży na dysku. Sprawdzenie: `doppler --version`.
+
+`make install-firewall` instaluje też `ipset` — CD aplikacji zakłada nim filtr portów kontenerów w łańcuchu
+`DOCKER-USER` (np. 80/443 tylko z adresów Cloudflare).
+
 ## Krok 8 — kolejny użytkownik (np. `deploy`) przez `add_user.yml`
 
 Playbook `create_user.yml` (Krok 4) jest przywiązany na sztywno do `SERVER_USER_1`.
@@ -347,6 +367,7 @@ danych. Mogą mieć tę samą nazwę i różne hasła, nie mają ze sobą nic ws
 | `make verify-user` | sprawdź logowanie kluczem jako `SERVER_USER_1` |
 | `make harden-ssh` | wyłącz root/hasła w SSH (`playbooks/harden_ssh.yml`) |
 | `make install-docker-swarm` | zainstaluj Docker CE + `docker swarm init` (`playbooks/docker_swarm.yml`) |
+| `make install-doppler` | zainstaluj Doppler CLI z oficjalnego repo apt (`playbooks/doppler.yml`) — token podaje CD aplikacji, nie jest zapisywany na serwerze |
 | `make install-postgresql` | zainstaluj PostgreSQL + skonfiguruj dostęp dla Swarm + rolę `deploy` z `CREATEDB` (`playbooks/postgresql.yml`) |
 | `make add-user` | dodaj kolejnego usera z `NEW_USER_*` + klucz + weryfikacja logowania SSH (`playbooks/add_user.yml`) |
 

@@ -42,12 +42,15 @@
           (logowanie kluczem działa), potem `make harden-ssh`, i dopiero wtedy `make install-firewall`.
         success_msg: "SSH: logowanie tylko kluczem, bez roota - OK."
 
-    - name: Zainstaluj ufw, fail2ban i python3-systemd (fail2ban czyta journald)
+    # ipset — filtr portów kontenerów w łańcuchu DOCKER-USER (np. 80/443 tylko z adresów Cloudflare) zakłada CD
+    # aplikacji; potrzebuje do tego ipset na hoście.
+    - name: Zainstaluj ufw, fail2ban, python3-systemd (fail2ban czyta journald) i ipset (filtr DOCKER-USER w CD)
       ansible.builtin.apt:
         name:
           - ufw
           - fail2ban
           - python3-systemd
+          - ipset
         state: present
         update_cache: true
 

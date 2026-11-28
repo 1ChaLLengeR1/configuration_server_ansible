@@ -1,0 +1,47 @@
+---
+# Doppler CLI na serwerze — sekrety aplikacji idą z Dopplera prosto do procesu kontenera (CD aplikacji robi
+# `doppler secrets download --token … | docker secret create …`), bez plików .env na dysku.
+#
+# Playbook instaluje TYLKO samo CLI z oficjalnego repozytorium apt Dopplera (klucz GPG pobierany i zaufany
+# automatycznie, jak repo Dockera w docker_swarm.yml). Nie loguje się i nie zapisuje żadnego tokenu na serwerze —
+# service token podaje CD aplikacji przy każdym wywołaniu (`--token`), z zaszyfrowanego vaulta.
+- name: Zainstaluj Doppler CLI
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Zainstaluj zależności repozytorium (apt-transport-https, ca-certificates, gnupg)
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+        update_cache: true
+
+    - name: Dodaj repozytorium apt Doppler CLI (klucz GPG pobierany i zaufany automatycznie)
+      ansible.builtin.deb822_repository:
+        name: doppler-cli
+        types: deb
+        uris: "https://packages.doppler.com/public/cli/deb/debian"
+        suites: any-version
+        components: main
+        signed_by: "https://packages.doppler.com/public/cli/gpg.DE2A7741A397C129.key"
+        install_python_debian: true
+        state: present
+
+    - name: Zainstaluj Doppler CLI
+      ansible.builtin.apt:
+        name: doppler
+        state: present
+        update_cache: true
+
+    - name: Sprawdź wersję Doppler CLI
+      ansible.builtin.command: doppler --version
+      register: doppler_version
+      changed_when: false
+
+    - name: Doppler CLI zainstalowany
+      ansible.builtin.debug:
+        msg: "doppler {{ doppler_version.stdout }}"
